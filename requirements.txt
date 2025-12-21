@@ -1,0 +1,32 @@
+# --- 1. 基礎數據架構 ---
+pandas
+numpy
+openpyxl
+lxml
+html5lib
+requests
+cryptography
+
+# --- 2. 核心下載引擎 (Yahoo Finance & 進度條) ---
+yfinance
+tqdm
+
+# --- 3. 全球六國清單獲取 (特定市場套件) ---
+# [中國 A 股]
+akshare
+# [韓國股市]
+pykrx
+# [日本股市]
+tokyo-stock-exchange
+
+# --- 4. Google Drive 雲端同步 (API 核心) ---
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+
+# --- 5. 數據庫與本地維護 (Python 內建 sqlite3，但部分環境需 pysqlite3) ---
+# 通常不需額外安裝，但若環境極簡可備用
+# pysqlite3
+
+# --- 6. 通知系統 (選配，如需執行結束傳送 Email) ---
+# resend
