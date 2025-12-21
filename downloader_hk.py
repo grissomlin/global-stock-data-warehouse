@@ -28,6 +28,7 @@ def classify_security(name: str) -> str:
 def get_full_stock_list():
     """從 HKEX 獲取證券名單"""
     print("📡 正在從港交所 (HKEX) 獲取最新普通股清單...")
+    # HKEX 官方 Excel 清單路徑
     url = "https://www.hkex.com.hk/-/media/HKEX-Market/Services/Trading/Securities/Securities-Lists/Securities-Using-Standard-Transfer-Form-(including-GEM)-By-Stock-Code-Order/secstkorder.xls"
     
     try:
@@ -67,9 +68,12 @@ def get_full_stock_list():
 def fetch_single_stock(symbol, period):
     """單檔下載：具備隨機延遲與時區處理"""
     try:
-        time.sleep(random.uniform(0.5, 1.2))
+        # 下載 max 數據量較大，稍稍延長延遲時間以示友好
+        time.sleep(random.uniform(0.6, 1.5))
         tk = yf.Ticker(symbol)
-        hist = tk.history(period=period, timeout=20)
+        
+        # 增加 timeout 到 30 秒應對長歷史下載
+        hist = tk.history(period=period, timeout=30)
         
         if hist is not None and not hist.empty:
             hist = hist.reset_index()
@@ -80,16 +84,17 @@ def fetch_single_stock(symbol, period):
                 hist['date'] = pd.to_datetime(hist['date'], utc=True).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
                 hist['symbol'] = symbol
                 return hist[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
-    except:
+    except Exception:
         return None
     return None
 
 def fetch_hk_market_data(is_first_time=False):
     """主進入點：回傳給 main.py 的數據集"""
-    period = "10y" if is_first_time else "7d"
+    # ✨ 修改點：將 10y 改為 max
+    period = "max" if is_first_time else "7d"
     items = get_full_stock_list()
     
-    print(f"🚀 港股任務啟動: {'深度歷史(10y)' if is_first_time else '增量更新(7d)'}, 目標: {len(items)} 檔")
+    print(f"🚀 港股任務啟動: {'全量歷史(max)' if is_first_time else '增量更新(7d)'}, 目標: {len(items)} 檔")
     
     all_dfs = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
