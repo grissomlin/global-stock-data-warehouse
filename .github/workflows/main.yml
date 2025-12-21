@@ -1,24 +1,14 @@
 name: Global Stock Matrix Monitor
 
 on:
-  # 1. 支援手動觸發並自定義參數
   workflow_dispatch:
     inputs:
       market:
-        description: '選擇執行市場 (all / tw / us / cn / hk / jp / kr)'
+        description: '選擇執行市場'
         required: true
         default: 'all'
         type: choice
-        options:
-          - all
-          - tw
-          - us
-          - cn
-          - hk
-          - jp
-          - kr
-
-  # 2. 定期自動執行 (例如每天台北時間 18:30)
+        options: [all, tw, us, cn, hk, jp, kr]
   schedule:
     - cron: '30 10 * * 1-5'
 
@@ -30,7 +20,6 @@ jobs:
     steps:
       - id: set-matrix
         run: |
-          # 根據輸入決定矩陣內容
           if [[ "${{ github.event.inputs.market }}" == "all" || "${{ github.event_name }}" == "schedule" ]]; then
             echo "matrix_list=[\"tw\", \"us\", \"cn\", \"hk\", \"jp\", \"kr\"]" >> $GITHUB_OUTPUT
           else
@@ -42,7 +31,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 動態接收 prepare-matrix 的結果
         market: ${{ fromJson(needs.prepare-matrix.outputs.matrix_list) }}
     
     runs-on: ubuntu-latest
@@ -54,18 +42,61 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-          cache: 'pip' # 快取 pip 套件加速執行
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Global Stock Monitor
+      # ✨ 新增步驟：根據當前 Matrix 市場下載對應的 DB 檔案
+      - name: Download Market Specific DB
         env:
-          # 讀取你在 GitHub Secrets 設定的環境變數
+          GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+        run: |
+          python -c "
+          import os, json, sqlite3
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload
+          import io
+
+          # 1. 設定
+          market = '${{ matrix.market }}'
+          db_file = f'{market}_stock_warehouse.db'
+          folder_id = '1ltKCQ209k9MFuWV6FIxQ1coinV2fxSyl'
+          
+          # 2. 驗證金鑰
+          env_json = os.environ.get('GDRIVE_SERVICE_ACCOUNT')
+          if not env_json: 
+              print('No Secrets found, skipping download...')
+              exit(0)
+          
+          info = json.loads(env_json)
+          creds = service_account.Credentials.from_service_account_info(info)
+          service = build('drive', 'v3', credentials=creds)
+          
+          # 3. 搜尋該市場專屬 DB
+          query = f\"name = '{db_file}' and '{folder_id}' in parents and trashed = false\"
+          files = service.files().list(q=query, fields='files(id)').execute().get('files', [])
+          
+          if files:
+              file_id = files[0]['id']
+              print(f'Downloading {db_file} (ID: {file_id})...')
+              request = service.files().get_media(fileId=file_id)
+              fh = io.FileIO(db_file, 'wb')
+              downloader = MediaIoBaseDownload(fh, request)
+              done = False
+              while not done:
+                  status, done = downloader.next_chunk()
+              print(f'Download Complete.')
+          else:
+              print(f'No existing DB for {market}, will create a new one.')
+          "
+
+      - name: Run Market Update
+        env:
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
         run: |
-          # 執行 main.py 並傳入矩陣中的市場參數
+          # 執行 main.py 並傳入當前矩陣的市場
           python main.py ${{ matrix.market }}
