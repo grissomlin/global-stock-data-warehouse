@@ -16,7 +16,7 @@ ensure_pkg("tokyo-stock-exchange", "tokyo_stock_exchange")
 from tokyo_stock_exchange import tse
 
 # ========== 核心參數設定 ==========
-MAX_WORKERS = 4  # 日本市場頻率限制中等，建議 4 以內
+MAX_WORKERS = 4  # 日股檔數極多，建議維持 4 以避免觸發 Yahoo API 頻率限制
 
 def get_full_stock_list():
     """獲取日股完整清單 (TSE)"""
@@ -25,13 +25,13 @@ def get_full_stock_list():
     try:
         df = pd.read_csv(tse.csv_file_path)
         
-        # 識別代碼欄位
+        # 識別代碼欄位 (日文/英文通用相容)
         code_col = next((c for c in ['コード', 'Code', 'code', 'Local Code'] if c in df.columns), None)
         
         res = []
         for _, row in df.iterrows():
             code = str(row[code_col]).strip()
-            # 日本股代碼通常為 4 位數字
+            # 日本股代碼通常為 4 位數字，Yahoo 格式為 1234.T
             if len(code) >= 4 and code[:4].isdigit():
                 res.append(f"{code[:4]}.T")
         
@@ -45,18 +45,18 @@ def get_full_stock_list():
     except Exception as e:
         print(f"❌ 日股清單獲取失敗: {e}")
     
-    # 保底標的 (豐田汽車)
+    # 保底標的 (豐田汽車 7203.T)
     return ["7203.T"]
 
 def fetch_single_stock(symbol, period):
-    """單檔下載：加入隨機延遲與時區處理"""
+    """單檔下載：加入隨機延遲與長歷史下載支援"""
     try:
-        # 日本市場建議休眠 0.3 ~ 0.8 秒
-        time.sleep(random.uniform(0.3, 0.8))
+        # 下載 max 歷史數據量大，隨機休眠 0.5 ~ 1.2 秒
+        time.sleep(random.uniform(0.5, 1.2))
         
         tk = yf.Ticker(symbol)
-        # 根據 main.py 需求抓取 10y 或 7d
-        hist = tk.history(period=period, interval="1d", auto_adjust=True)
+        # 增加 timeout 至 30 秒，因為 max 模式的數據包通常較大
+        hist = tk.history(period=period, interval="1d", auto_adjust=True, timeout=30)
         
         if hist is not None and not hist.empty:
             hist = hist.reset_index()
@@ -66,21 +66,22 @@ def fetch_single_stock(symbol, period):
             if 'date' in hist.columns:
                 hist['date'] = pd.to_datetime(hist['date'], utc=True).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
                 hist['symbol'] = symbol
-                # 確保返回資料庫所需的標準欄位
+                # 確保回傳標準欄位，避開不需要的資料 (如 Dividends, Stock Splits)
                 return hist[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
-    except:
+    except Exception:
         return None
     return None
 
 def fetch_jp_market_data(is_first_time=False):
     """主進入點：回傳給 main.py 的數據集"""
-    # 💡 為了回測千日新高，初次抓取 10 年
-    period = "10y" if is_first_time else "7d"
+    # ✨ 修改點：初次抓取由 10y 改為 max
+    period = "max" if is_first_time else "7d"
     items = get_full_stock_list()
     
-    print(f"🚀 日股任務啟動: {'全量(10y)' if is_first_time else '增量(7d)'}, 目標: {len(items)} 檔")
+    print(f"🚀 日股任務啟動: {'全量歷史(max)' if is_first_time else '增量更新(7d)'}, 目標: {len(items)} 檔")
     
     all_dfs = []
+    # 使用線程池平行下載
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(fetch_single_stock, tkr, period): tkr for tkr in items}
         
