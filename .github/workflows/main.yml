@@ -1,18 +1,29 @@
 name: Global Stock Matrix Monitor
 
 on:
+  # 1. 手動觸發並自定義市場參數
   workflow_dispatch:
     inputs:
       market:
-        description: '選擇執行市場'
+        description: '選擇執行市場 (all / tw / us / cn / hk / jp / kr)'
         required: true
         default: 'all'
         type: choice
-        options: [all, tw, us, cn, hk, jp, kr]
+        options:
+          - all
+          - tw
+          - us
+          - cn
+          - hk
+          - jp
+          - kr
+
+  # 2. 定期自動執行 (週一至週五，台北時間 18:30)
   schedule:
     - cron: '30 10 * * 1-5'
 
 jobs:
+  # 階段一：準備矩陣列表
   prepare-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -26,14 +37,18 @@ jobs:
             echo "matrix_list=[\"${{ github.event.inputs.market }}\"]" >> $GITHUB_OUTPUT
           fi
 
+  # 階段二：平行執行抓取任務
   execute-task:
     needs: prepare-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 設定最高 6 小時超時，應對 MAX 歷史下載
+    
     strategy:
-      fail-fast: false
+      fail-fast: false      # 即使其中一個市場失敗，其他市場也要繼續跑完
       matrix:
+        # 根據 prepare-matrix 的結果開多台虛擬機（同時跑 6 國）
         market: ${{ fromJson(needs.prepare-matrix.outputs.matrix_list) }}
     
-    runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -41,62 +56,61 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.11' # 使用較新穩定版
           cache: 'pip'
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✨ 新增步驟：根據當前 Matrix 市場下載對應的 DB 檔案
+      # ✨ 關鍵步驟：從 Google Drive 下載該市場專屬的 DB 檔案
       - name: Download Market Specific DB
         env:
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
         run: |
           python -c "
-          import os, json, sqlite3
+          import os, json
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaIoBaseDownload
           import io
 
-          # 1. 設定
           market = '${{ matrix.market }}'
           db_file = f'{market}_stock_warehouse.db'
           folder_id = '1ltKCQ209k9MFuWV6FIxQ1coinV2fxSyl'
           
-          # 2. 驗證金鑰
           env_json = os.environ.get('GDRIVE_SERVICE_ACCOUNT')
-          if not env_json: 
-              print('No Secrets found, skipping download...')
+          if not env_json:
+              print('❌ 未設定 GDRIVE_SERVICE_ACCOUNT Secret')
               exit(0)
           
           info = json.loads(env_json)
           creds = service_account.Credentials.from_service_account_info(info)
           service = build('drive', 'v3', credentials=creds)
           
-          # 3. 搜尋該市場專屬 DB
           query = f\"name = '{db_file}' and '{folder_id}' in parents and trashed = false\"
           files = service.files().list(q=query, fields='files(id)').execute().get('files', [])
           
           if files:
               file_id = files[0]['id']
-              print(f'Downloading {db_file} (ID: {file_id})...')
+              print(f'📡 偵測到雲端檔案，正在下載 {db_file}...')
               request = service.files().get_media(fileId=file_id)
               fh = io.FileIO(db_file, 'wb')
               downloader = MediaIoBaseDownload(fh, request)
               done = False
               while not done:
                   status, done = downloader.next_chunk()
-              print(f'Download Complete.')
+              print(f'✅ 下載完成。')
           else:
-              print(f'No existing DB for {market}, will create a new one.')
+              print(f'🆕 雲端尚無 {db_file}，將由 main.py 建立新檔。')
           "
 
+      # ✨ 執行主程式：更新資料庫並自動上傳回雲端
       - name: Run Market Update
         env:
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
         run: |
-          # 執行 main.py 並傳入當前矩陣的市場
+          # 這裡會執行 main.py 的 upload_to_drive 邏輯
           python main.py ${{ matrix.market }}
