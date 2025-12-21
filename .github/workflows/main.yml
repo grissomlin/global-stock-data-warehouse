@@ -1,7 +1,6 @@
 name: Global Stock Matrix Monitor
 
 on:
-  # 1. 手動觸發並自定義市場參數
   workflow_dispatch:
     inputs:
       market:
@@ -9,21 +8,11 @@ on:
         required: true
         default: 'all'
         type: choice
-        options:
-          - all
-          - tw
-          - us
-          - cn
-          - hk
-          - jp
-          - kr
-
-  # 2. 定期自動執行 (週一至週五，台北時間 18:30)
+        options: [all, tw, us, cn, hk, jp, kr]
   schedule:
     - cron: '30 10 * * 1-5'
 
 jobs:
-  # 階段一：準備矩陣列表
   prepare-matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -37,16 +26,13 @@ jobs:
             echo "matrix_list=[\"${{ github.event.inputs.market }}\"]" >> $GITHUB_OUTPUT
           fi
 
-  # 階段二：平行執行抓取任務
   execute-task:
     needs: prepare-matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 設定最高 6 小時超時，應對 MAX 歷史下載
-    
+    timeout-minutes: 360
     strategy:
-      fail-fast: false      # 即使其中一個市場失敗，其他市場也要繼續跑完
+      fail-fast: false
       matrix:
-        # 根據 prepare-matrix 的結果開多台虛擬機（同時跑 6 國）
         market: ${{ fromJson(needs.prepare-matrix.outputs.matrix_list) }}
     
     steps:
@@ -56,7 +42,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11' # 使用較新穩定版
+          python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
@@ -64,7 +50,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✨ 關鍵步驟：從 Google Drive 下載該市場專屬的 DB 檔案
       - name: Download Market Specific DB
         env:
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
@@ -82,7 +67,7 @@ jobs:
           
           env_json = os.environ.get('GDRIVE_SERVICE_ACCOUNT')
           if not env_json:
-              print('❌ 未設定 GDRIVE_SERVICE_ACCOUNT Secret')
+              print('No Secrets found.')
               exit(0)
           
           info = json.loads(env_json)
@@ -94,23 +79,21 @@ jobs:
           
           if files:
               file_id = files[0]['id']
-              print(f'📡 偵測到雲端檔案，正在下載 {db_file}...')
+              print(f'Downloading {db_file}...')
               request = service.files().get_media(fileId=file_id)
               fh = io.FileIO(db_file, 'wb')
               downloader = MediaIoBaseDownload(fh, request)
               done = False
               while not done:
                   status, done = downloader.next_chunk()
-              print(f'✅ 下載完成。')
+              print(f'Download Complete.')
           else:
-              print(f'🆕 雲端尚無 {db_file}，將由 main.py 建立新檔。')
+              print(f'No existing DB for {market}.')
           "
 
-      # ✨ 執行主程式：更新資料庫並自動上傳回雲端
       - name: Run Market Update
         env:
           GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
         run: |
-          # 這裡會執行 main.py 的 upload_to_drive 邏輯
           python main.py ${{ matrix.market }}
