@@ -1,6 +1,71 @@
-- name: Run Scraper
-  env:
-    # 這裡將 GitHub Secret 對應到 Python 能抓到的環境變數
-    GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
-  run: |
-    python main.py
+name: Global Stock Matrix Monitor
+
+on:
+  # 1. 支援手動觸發並自定義參數
+  workflow_dispatch:
+    inputs:
+      market:
+        description: '選擇執行市場 (all / tw / us / cn / hk / jp / kr)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - tw
+          - us
+          - cn
+          - hk
+          - jp
+          - kr
+
+  # 2. 定期自動執行 (例如每天台北時間 18:30)
+  schedule:
+    - cron: '30 10 * * 1-5'
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_list: ${{ steps.set-matrix.outputs.matrix_list }}
+    steps:
+      - id: set-matrix
+        run: |
+          # 根據輸入決定矩陣內容
+          if [[ "${{ github.event.inputs.market }}" == "all" || "${{ github.event_name }}" == "schedule" ]]; then
+            echo "matrix_list=[\"tw\", \"us\", \"cn\", \"hk\", \"jp\", \"kr\"]" >> $GITHUB_OUTPUT
+          else
+            echo "matrix_list=[\"${{ github.event.inputs.market }}\"]" >> $GITHUB_OUTPUT
+          fi
+
+  execute-task:
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        # 動態接收 prepare-matrix 的結果
+        market: ${{ fromJson(needs.prepare-matrix.outputs.matrix_list) }}
+    
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip' # 快取 pip 套件加速執行
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Global Stock Monitor
+        env:
+          # 讀取你在 GitHub Secrets 設定的環境變數
+          GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        run: |
+          # 執行 main.py 並傳入矩陣中的市場參數
+          python main.py ${{ matrix.market }}
