@@ -1,0 +1,6 @@
+- name: Run Scraper
+  env:
+    # 這裡將 GitHub Secret 對應到 Python 能抓到的環境變數
+    GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+  run: |
+    python main.py
