@@ -53,31 +53,40 @@ def get_full_stock_list():
     return unique_items
 
 def fetch_single_stock(yf_tkr, period):
-    """單檔下載邏輯"""
-    time.sleep(random.uniform(0.5, 1.2))
+    """單檔下載邏輯：支援長時間歷史與抗封鎖重試"""
     try:
+        time.sleep(random.uniform(0.6, 1.2))
         tk = yf.Ticker(yf_tkr)
+        # 增加重試機制
         for attempt in range(2):
             try:
-                hist = tk.history(period=period, timeout=15)
+                # 抓取 max 資料包較大，增加 timeout
+                hist = tk.history(period=period, auto_adjust=True, timeout=25)
                 if hist is not None and not hist.empty:
-                    hist.reset_index(inplace=True)
+                    hist = hist.reset_index()
                     hist.columns = [c.lower() for c in hist.columns]
-                    hist['date'] = pd.to_datetime(hist['date']).dt.strftime('%Y-%m-%d')
-                    hist['symbol'] = yf_tkr
-                    return hist[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+                    # 日期標準化
+                    if 'date' in hist.columns:
+                        hist['date'] = pd.to_datetime(hist['date'], utc=True).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+                        hist['symbol'] = yf_tkr
+                        return hist[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+                break # 成功則跳出重試
             except Exception as e:
-                if "Rate limited" in str(e): time.sleep(random.uniform(20, 40))
+                if "Rate limited" in str(e): 
+                    print(f"🛑 {yf_tkr} 觸發限流，等待中...")
+                    time.sleep(random.uniform(20, 40))
                 time.sleep(random.uniform(2, 5))
-    except: return None
+    except: 
+        return None
+    return None
 
 def fetch_tw_market_data(is_first_time=False):
-    """主進入點"""
-    # 10y 歷史用於建立倉庫，7d 增量用於每日更新
-    period = "10y" if is_first_time else "7d"
+    """主進入點：由 main.py 呼叫"""
+    # ✨ 修改點：將 10y 改為 max 以獲取最完整歷史
+    period = "max" if is_first_time else "7d"
     items = get_full_stock_list()
     
-    print(f"🚀 台股任務啟動: {'全量(10y)' if is_first_time else '增量(7d)'}, 總數: {len(items)}")
+    print(f"🚀 台股任務啟動: {'全量歷史(max)' if is_first_time else '增量更新(7d)'}, 總數: {len(items)}")
     
     all_dfs = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -85,8 +94,14 @@ def fetch_tw_market_data(is_first_time=False):
         count = 0
         for future in as_completed(futures):
             res = future.result()
-            if res is not None: all_dfs.append(res)
+            if res is not None: 
+                all_dfs.append(res)
             count += 1
-            if count % 100 == 0: print(f"📊 處理中... {count}/{len(items)}")
-            
-    return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+            if count % 100 == 0: 
+                print(f"📊 已處理 {count}/{len(items)} 檔台股...")
+    
+    if all_dfs:
+        final_df = pd.concat(all_dfs, ignore_index=True)
+        print(f"✨ 台股處理完成，共獲取 {len(final_df)} 筆交易記錄")
+        return final_df
+    return pd.DataFrame()
