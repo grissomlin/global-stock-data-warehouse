@@ -5,6 +5,13 @@ import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ========== 路徑與參數設定 ==========
+MAX_WORKERS = 4 
+DB_NAME = "cn_stock_warehouse.db"
+# 針對 Colab 環境設定快取路徑，若在其他環境執行會自動切換至當前目錄
+CACHE_DIR = "/content/drive/MyDrive/各國股票檔案/logs"
+CACHE_FILE = os.path.join(CACHE_DIR, "cn_symbols_cache.json")
+
 # ====== 自動安裝必要套件 ======
 def ensure_pkg(pkg: str):
     try:
@@ -12,10 +19,6 @@ def ensure_pkg(pkg: str):
     except ImportError:
         print(f"🔧 正在安裝 {pkg}...")
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg])
-
-# ========== 核心參數設定 ==========
-MAX_WORKERS = 4  # A 股維持 4，避免 Yahoo 封鎖
-DB_NAME = "cn_stock_warehouse.db"
 
 def init_db():
     """自動初始化資料庫結構"""
@@ -39,39 +42,78 @@ def init_db():
     print(f"📁 資料庫 {DB_NAME} 已就緒")
 
 def get_full_stock_list():
-    """獲取 A 股清單 (含 Akshare 失敗後的強力備援)"""
+    """獲取 A 股清單 (四層防禦機制)"""
     ensure_pkg("akshare")
     import akshare as ak
     
-    print("📡 正在獲取 A 股清單...")
+    threshold = 4000
+    res = []
+
+    # --- Level 1: 標準接口 (stock_info_a_code_name) ---
+    print("📡 [Level 1] 嘗試 Akshare 標準接口...")
     try:
-        # 嘗試第一個接口 (東方財富)
         df = ak.stock_info_a_code_name()
-        df['code'] = df['code'].astype(str).str.zfill(6)
-        valid_prefixes = ('000','001','002','300','600','601','603','605')
-        df = df[df['code'].str.startswith(valid_prefixes)]
-        
-        res = [f"{c}.SS" if c.startswith('6') else f"{c}.SZ" for c in df['code']]
-        if len(res) > 4000:
-            print(f"✅ 透過 akshare 成功獲取 {len(res)} 檔代號")
+        if not df.empty:
+            df['code'] = df['code'].astype(str).str.zfill(6)
+            valid_prefixes = ('000','001','002','300','600','601','603','605')
+            df = df[df['code'].str.startswith(valid_prefixes)]
+            res = [f"{c}.SS" if c.startswith('6') else f"{c}.SZ" for c in df['code']]
+            if len(res) >= threshold:
+                save_cache(res)
+                print(f"✅ Level 1 成功 ({len(res)} 檔)")
+                return list(set(res))
+    except Exception as e:
+        print(f"⚠️ Level 1 異常: {e}")
+
+    # --- Level 2: 即時行情接口 (EM 接口，通常較穩定) ---
+    print("📡 [Level 2] 嘗試即時行情接口 (EM)...")
+    try:
+        df_sh = ak.stock_sh_a_spot_em()
+        df_sz = ak.stock_sz_a_spot_em()
+        all_codes = []
+        if not df_sh.empty: all_codes += df_sh['代码'].astype(str).str.zfill(6).tolist()
+        if not df_sz.empty: all_codes += df_sz['代码'].astype(str).str.zfill(6).tolist()
+        res = [f"{c}.SS" if c.startswith('6') else f"{c}.SZ" for c in all_codes]
+        if len(res) >= threshold:
+            save_cache(res)
+            print(f"✅ Level 2 成功 ({len(res)} 檔)")
             return list(set(res))
     except Exception as e:
-        print(f"⚠️ Akshare 接口連線異常: {e}")
+        print(f"⚠️ Level 2 異常: {e}")
 
-    # --- 強力備援：核心權值股清單 (避免 GitHub Action 失敗只抓一檔) ---
-    print("💡 啟動備援機制：使用 A 股核心權值股清單 (100 檔)")
-    backup_list = [
-        "600519.SS", "601318.SS", "600036.SS", "601398.SS", "601857.SS", "601288.SS", "601939.SS", "601988.SS", "600028.SS", "600900.SS",
-        "601088.SS", "601628.SS", "601166.SS", "600030.SS", "601328.SS", "600309.SS", "601138.SS", "601319.SS", "600048.SS", "600019.SS",
-        "000858.SZ", "000333.SZ", "002415.SZ", "000001.SZ", "300750.SZ", "000651.SZ", "002594.SZ", "300059.SZ", "000725.SZ", "002475.SZ",
-        "000100.SZ", "000002.SZ", "000768.SZ", "002304.SZ", "002352.SZ", "002714.SZ", "300015.SZ", "300760.SZ", "000538.SZ", "000895.SZ"
-    ] # 此處僅列部分示範，可自行增補
-    return backup_list
+    # --- Level 3: 讀取 Drive 快取 ---
+    print(f"📡 [Level 3] 嘗試讀取快取檔...")
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                res = json.load(f)
+            if len(res) >= threshold:
+                print(f"♻️ Level 3 成功: 從快取恢復 {len(res)} 檔")
+                return res
+        except:
+            pass
+
+    # --- Level 4: 最終備援 (核心權值股) ---
+    print("🚨 [Level 4] 所有連線失效且無快取，使用權值股保底...")
+    return [
+        "600519.SS", "601318.SS", "600036.SS", "601398.SS", "601857.SS", 
+        "000858.SZ", "000333.SZ", "002415.SZ", "000001.SZ", "300750.SZ"
+    ]
+
+def save_cache(data):
+    """將清單存入快取"""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(data, f)
+        print(f"💾 清單已備份至: {CACHE_FILE}")
+    except Exception as e:
+        print(f"📦 快取寫入失敗: {e}")
 
 def fetch_single_stock(symbol, period):
     """單檔下載邏輯"""
     try:
-        time.sleep(random.uniform(0.5, 1.2)) # 稍作延遲保護
+        time.sleep(random.uniform(0.6, 1.5)) # 略微拉長等待時間保護連線
         tk = yf.Ticker(symbol)
         hist = tk.history(period=period, timeout=30)
         
@@ -88,7 +130,7 @@ def fetch_single_stock(symbol, period):
 
 def fetch_cn_market_data(is_first_time=False):
     """主進入點"""
-    init_db() # 確保資料庫存在
+    init_db()
     period = "max" if is_first_time else "7d"
     items = get_full_stock_list()
     
@@ -97,26 +139,20 @@ def fetch_cn_market_data(is_first_time=False):
     all_dfs = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(fetch_single_stock, tkr, period): tkr for tkr in items}
-        
         count = 0
         for future in as_completed(futures):
             res = future.result()
             if res is not None:
                 all_dfs.append(res)
-            
             count += 1
             if count % 100 == 0:
-                print(f"📊 進度: {count}/{len(items)} 檔處理中...")
+                print(f"📊 下載進度: {count}/{len(items)}...")
 
     if all_dfs:
         final_df = pd.concat(all_dfs, ignore_index=True)
-        print(f"✨ 處理完成，共獲取 {len(final_df)} 筆交易記錄")
+        print(f"✨ 任務完成，獲取 {len(final_df)} 筆記錄")
         return final_df
     return pd.DataFrame()
 
-# 測試用執行區塊
 if __name__ == "__main__":
-    # 測試抓取 (False 代表增量模式)
     df = fetch_cn_market_data(is_first_time=False)
-    if not df.empty:
-        print(df.head())
