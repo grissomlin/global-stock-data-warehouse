@@ -35,6 +35,13 @@ jobs:
       matrix:
         market: ${{ fromJson(needs.prepare-matrix.outputs.matrix_list) }}
     
+    # 這裡加入環境變數，讓下方的所有 steps 都能讀到 Secrets
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v3
@@ -49,17 +56,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install resend  # 確保安裝了 resend SDK
 
       - name: Download Market Specific DB
-        env:
-          GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
         run: |
           python -c "
-          import os, json
+          import os, json, io
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaIoBaseDownload
-          import io
 
           market = '${{ matrix.market }}'
           db_file = f'{market}_stock_warehouse.db'
@@ -92,8 +97,46 @@ jobs:
           "
 
       - name: Run Market Update
-        env:
-          GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        id: run_update
         run: |
+          # 執行你的主程式
           python main.py ${{ matrix.market }}
+
+      # 如果成功，發送通知
+      - name: Notify Success
+        if: success()
+        run: |
+          python -c "
+          import os, requests, resend
+          
+          market = '${{ matrix.market }}'
+          msg = f'✅ 股市倉儲更新成功\n市場: {market.upper()}\n狀態: 數據已同步至 Google Drive'
+          
+          # Telegram
+          token = os.getenv('TELEGRAM_BOT_TOKEN')
+          chat_id = os.getenv('TELEGRAM_CHAT_ID')
+          requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg})
+          
+          # Resend (Email)
+          resend.api_key = os.getenv('RESEND_API_KEY')
+          resend.Emails.send({
+              'from': 'StockMonitor <onboarding@resend.dev>',
+              'to': 'your_email@example.com', # <--- 請改為你的信箱
+              'subject': f'Success: {market.upper()} Data Warehouse Updated',
+              'html': f'<p>{msg}</p>'
+          })
+          "
+
+      # 如果失敗，發送通知
+      - name: Notify Failure
+        if: failure()
+        run: |
+          python -c "
+          import os, requests
+          market = '${{ matrix.market }}'
+          msg = f'❌ 股市倉儲更新失敗！\n市場: {market.upper()}\n請檢查 GitHub Actions Log。'
+          
+          token = os.getenv('TELEGRAM_BOT_TOKEN')
+          chat_id = os.getenv('TELEGRAM_CHAT_ID')
+          requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg})
+          "
