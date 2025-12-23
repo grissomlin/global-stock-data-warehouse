@@ -121,7 +121,7 @@ jobs:
           resend.api_key = os.getenv('RESEND_API_KEY')
           resend.Emails.send({
               'from': 'StockMonitor <onboarding@resend.dev>',
-              'to': 'your_email@example.com', # <--- 請改為你的信箱
+              'to': 'grissomlin643@gmail.com', # <--- 請改為你的信箱
               'subject': f'Success: {market.upper()} Data Warehouse Updated',
               'html': f'<p>{msg}</p>'
           })
