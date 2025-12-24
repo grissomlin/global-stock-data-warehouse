@@ -6,7 +6,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
-# 💡 確保傳輸穩定
+# 💡 全域逾時設定，確保大檔案傳輸不中斷
 socket.setdefaulttimeout(600)
 GDRIVE_FOLDER_ID = '1ltKCQ209k9MFuWV6FIxQ1coinV2fxSyl' 
 SERVICE_ACCOUNT_FILE = 'citric-biplane-319514-75fead53b0f5.json'
@@ -19,12 +19,12 @@ except ImportError:
 
 import downloader_tw, downloader_us, downloader_cn, downloader_hk, downloader_jp, downloader_kr
 
-# 📊 應收標的門檻 (這是計算覆蓋率的基準)
+# 📊 應收標的門檻 (計算覆蓋率的精確基準)
 EXPECTED_MIN_STOCKS = {
-    'tw': 900, 'us': 4000, 'cn': 5496, 'hk': 1500, 'jp': 3000, 'kr': 2000
+    'tw': 900, 'us': 5684, 'cn': 5496, 'hk': 2689, 'jp': 4315, 'kr': 2000
 }
 
-# ========== 1. Google Drive 傳輸核心 (無壓縮版) ==========
+# ========== Google Drive 核心函式 (加入重試機制) ==========
 
 def get_drive_service():
     env_json = os.environ.get('GDRIVE_SERVICE_ACCOUNT')
@@ -38,7 +38,7 @@ def get_drive_service():
             return None
         return build('drive', 'v3', credentials=creds, cache_discovery=False)
     except Exception as e:
-        print(f"❌ 無法初始化 Drive: {e}")
+        print(f"❌ 無法初始化 Drive 服務: {e}")
         return None
 
 def download_db_from_drive(service, file_name, retries=3):
@@ -49,7 +49,7 @@ def download_db_from_drive(service, file_name, retries=3):
             items = results.get('files', [])
             if not items: return False
             file_id = items[0]['id']
-            print(f"📡 下載雲端數據 ({attempt+1}/{retries}): {file_name}")
+            print(f"📡 正在下載雲端數據: {file_name}")
             request = service.files().get_media(fileId=file_id)
             fh = io.FileIO(file_name, 'wb')
             downloader = MediaIoBaseDownload(fh, request, chunksize=5*1024*1024)
@@ -58,7 +58,7 @@ def download_db_from_drive(service, file_name, retries=3):
                 status, done = downloader.next_chunk()
             return True
         except Exception as e:
-            print(f"⚠️ 下載失敗: {e}")
+            print(f"⚠️ 下載失敗 ({attempt+1}/3): {e}")
             time.sleep(5)
     return False
 
@@ -78,26 +78,19 @@ def upload_db_to_drive(service, file_path, retries=3):
             print(f"✅ 上傳完成: {file_name}")
             return True
         except Exception as e:
-            print(f"⚠️ 上傳失敗: {e}")
+            print(f"⚠️ 上傳失敗 ({attempt+1}/3): {e}")
             time.sleep(5)
     return False
 
-# ========== 2. 數據維護與精確統計 ==========
-
-def optimize_db(db_file):
-    try:
-        conn = sqlite3.connect(db_file)
-        conn.execute("VACUUM")
-        conn.close()
-    except: pass
+# ========== 數據統計核心 (保證撈取所有欄位) ==========
 
 def get_db_summary(db_path, market_id):
-    """計算包含 覆蓋率、總筆數、名稱同步 的完整統計"""
+    """精確從資料庫撈出：股票數、總筆數、名稱同步、最新日期"""
     try:
         conn = sqlite3.connect(db_path)
-        # 統計日K
+        # 1. 撈取日K行情統計 (總筆數、股票數、最新日期)
         df_stats = pd.read_sql("SELECT COUNT(DISTINCT symbol) as s, MAX(date) as d2, COUNT(*) as t FROM stock_prices", conn)
-        # 統計名稱
+        # 2. 撈取名稱同步檔數
         info_count = conn.execute("SELECT COUNT(*) FROM stock_info").fetchone()[0]
         conn.close()
 
@@ -116,10 +109,8 @@ def get_db_summary(db_path, market_id):
             "status": "✅" if coverage >= 90 else "⚠️"
         }
     except Exception as e:
-        print(f"⚠️ 統計出錯: {e}")
+        print(f"⚠️ 統計撈取失敗: {e}")
         return None
-
-# ========== 3. 主執行流程 ==========
 
 def main():
     target_market = sys.argv[1].lower() if len(sys.argv) > 1 else None
@@ -136,25 +127,24 @@ def main():
 
     for m in markets_to_run:
         db_file = f"{m}_stock_warehouse.db"
-        print(f"\n--- 🚀 市場啟動: {m.upper()} ---")
+        print(f"\n--- 🌍 市場啟動: {m.upper()} ---")
 
         if not os.path.exists(db_file):
             download_db_from_drive(service, db_file)
 
-        # 下載新數據 (熱更新模式)
         target_module = module_map.get(m)
         target_module.run_sync(mode='hot') 
 
-        # 收集統計數據
         summary = get_db_summary(db_file, m)
         if summary:
             all_summaries.append(summary)
 
-        # 優化並回傳雲端
-        optimize_db(db_file)
+        # 優化並上傳
+        conn = sqlite3.connect(db_file)
+        conn.execute("VACUUM")
+        conn.close()
         upload_db_to_drive(service, db_file)
 
-    # 彙整完所有市場後一次性發送 Email
     if notifier and all_summaries:
         notifier.send_stock_report_email(all_summaries)
 
