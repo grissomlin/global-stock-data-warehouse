@@ -102,3 +102,4 @@ class StockNotifier:
         except Exception as e:
             print(f"❌ 通報錯誤: {e}")
             return False
+
