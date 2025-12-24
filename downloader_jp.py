@@ -1,159 +1,158 @@
 # -*- coding: utf-8 -*-
-import os, sys, time, random, subprocess, sqlite3
+import os, sys, time, random, sqlite3, subprocess
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# ====== 自動安裝必要套件 ======
+# ========== 參數與路徑設定 ==========
+MARKET_CODE = "jp-share"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 💡 指向您的核心資料庫
+DB_PATH = os.path.join(BASE_DIR, "jp_stock_warehouse.db")
+
+# ✅ 效能與穩定性設定
+MAX_WORKERS = 4 
+DATA_EXPIRY_SECONDS = 3600
+
+def log(msg: str):
+    print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
+
 def ensure_pkg(pkg_install_name, import_name):
+    """確保必要套件已安裝"""
     try:
         __import__(import_name)
     except ImportError:
-        print(f"🔧 正在安裝 {pkg_install_name}...")
+        log(f"🔧 正在安裝 {pkg_install_name}...")
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg_install_name])
 
+# 載入日股清單工具
 ensure_pkg("tokyo-stock-exchange", "tokyo_stock_exchange")
 from tokyo_stock_exchange import tse
 
-# ========== 核心參數設定 ==========
-MARKET_CODE = "jp-share"
-DATA_SUBDIR = "dayK"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# 資料與審計資料庫路徑
-DATA_DIR = os.path.join(BASE_DIR, "data", MARKET_CODE, DATA_SUBDIR)
-AUDIT_DB_PATH = os.path.join(BASE_DIR, "data_warehouse_audit.db")
-
-# ✅ 效能與時效設定
-MAX_WORKERS = 4 
-DATA_EXPIRY_SECONDS = 3600  # 1 小時內抓過則跳過
-
-os.makedirs(DATA_DIR, exist_ok=True)
-
-def init_audit_db():
-    """初始化審計資料庫"""
-    conn = sqlite3.connect(AUDIT_DB_PATH)
-    conn.execute('''CREATE TABLE IF NOT EXISTS sync_audit (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        execution_time TEXT,
-        market_id TEXT,
-        total_count INTEGER,
-        success_count INTEGER,
-        fail_count INTEGER,
-        success_rate REAL
-    )''')
-    conn.close()
-
-def get_full_stock_list():
-    """獲取日股完整清單 (TSE)"""
-    threshold = 3000
-    print("📡 正在從 TSE 資料庫獲取日股清單...")
+def init_db():
+    """初始化資料庫結構"""
+    conn = sqlite3.connect(DB_PATH)
     try:
-        df = pd.read_csv(tse.csv_file_path)
-        code_col = next((c for c in ['コード', 'Code', 'code', 'Local Code'] if c in df.columns), None)
-        
-        res = []
-        for _, row in df.iterrows():
-            code = str(row[code_col]).strip()
-            # 日本股 Yahoo 格式為 1234.T
-            if len(code) >= 4 and code[:4].isdigit():
-                res.append(f"{code[:4]}.T")
-        
-        final_list = list(set(res))
-        if len(final_list) >= threshold:
-            print(f"✅ 成功獲取 {len(final_list)} 檔日股代號")
-            return final_list
-    except Exception as e:
-        print(f"❌ 日股清單獲取失敗: {e}")
-    
-    return ["7203.T"] # 豐田汽車保底
-
-def download_one(symbol, period):
-    """單檔下載邏輯：智慧快取 + 抗封鎖機制"""
-    out_path = os.path.join(DATA_DIR, f"{symbol}.csv")
-    
-    # 💡 智慧快取檢查 (1小時內抓過則跳過)
-    if os.path.exists(out_path):
-        file_age = time.time() - os.path.getmtime(out_path)
-        if file_age < DATA_EXPIRY_SECONDS and os.path.getsize(out_path) > 1000:
-            return {"status": "exists", "tkr": symbol}
-
-    try:
-        # 下載 max 歷史數據量大，隨機休眠 0.6 ~ 1.3 秒
-        time.sleep(random.uniform(0.6, 1.3))
-        tk = yf.Ticker(symbol)
-        hist = tk.history(period=period, timeout=30)
-        
-        if hist is not None and not hist.empty:
-            hist = hist.reset_index()
-            hist.columns = [c.lower() for c in hist.columns]
-            if 'date' in hist.columns:
-                hist['date'] = pd.to_datetime(hist['date'], utc=True).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-                hist['symbol'] = symbol
-                # 儲存 CSV
-                hist[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']].to_csv(out_path, index=False, encoding='utf-8-sig')
-                return {"status": "success", "tkr": symbol}
-        return {"status": "empty", "tkr": symbol}
-    except:
-        return {"status": "error", "tkr": symbol}
-
-# ✨ 關鍵進入點：改名為 main() 以對齊 main.py
-def main():
-    start_time = time.time()
-    init_audit_db()
-    
-    # 判斷是否初次下載 (透過 main.py 或內部設定)
-    # 這裡為了維持一致性，預設為 7d，若要補歷史請改為 max
-    period = "7d" 
-    
-    items = get_full_stock_list()
-    print(f"🚀 日股任務啟動: {period}, 目標: {len(items)} 檔")
-    
-    stats = {"success": 0, "exists": 0, "empty": 0, "error": 0}
-    fail_list = []
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(download_one, tkr, period): tkr for tkr in items}
-        pbar = tqdm(total=len(items), desc="JP 下載進度")
-        
-        for future in as_completed(futures):
-            res = future.result()
-            s = res.get("status", "error")
-            stats[s] += 1
-            if s in ["error", "empty"]:
-                fail_list.append(res.get("tkr", "Unknown"))
-            pbar.update(1)
-        pbar.close()
-
-    total = len(items)
-    success = stats['success'] + stats['exists']
-    fail = stats['error'] + stats['empty']
-    rate = round((success / total * 100), 2) if total > 0 else 0
-
-    # 🚀 紀錄 Audit DB (台北時間 UTC+8)
-    conn = sqlite3.connect(AUDIT_DB_PATH)
-    try:
-        now_ts = (datetime.utcnow() + pd.Timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute('''INSERT INTO sync_audit 
-            (execution_time, market_id, total_count, success_count, fail_count, success_rate)
-            VALUES (?, ?, ?, ?, ?, ?)''', (now_ts, MARKET_CODE, total, success, fail, rate))
+        conn.execute('''CREATE TABLE IF NOT EXISTS stock_prices (
+                            date TEXT, symbol TEXT, open REAL, high REAL, 
+                            low REAL, close REAL, volume INTEGER,
+                            PRIMARY KEY (date, symbol))''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS stock_info (
+                            symbol TEXT PRIMARY KEY,
+                            name TEXT,
+                            sector TEXT,
+                            updated_at TEXT)''')
         conn.commit()
     finally:
         conn.close()
 
-    # ✨ 回傳 Dictionary 給 main.py 產生通知報表
-    download_stats = {
-        "total": total,
-        "success": success,
-        "fail": fail,
-        "fail_list": fail_list
-    }
+def get_jp_stock_list():
+    """獲取日股清單並同步更新名稱"""
+    log("📡 正在從 TSE 數據庫獲取最新日股名單與名稱...")
+    try:
+        # 讀取套件內建的日股清單 CSV
+        df = pd.read_csv(tse.csv_file_path)
+        
+        # 識別欄位 (日本股代號通常在 'Code' 或 'コード')
+        code_col = next((c for c in ['コード', 'Code', 'code', 'Local Code'] if c in df.columns), None)
+        name_col = next((c for c in ['銘柄名', 'Name', 'name', 'Issues'] if c in df.columns), None)
+        sector_col = next((c for c in ['33業種区分', 'Sector', 'industry'] if c in df.columns), None)
+
+        conn = sqlite3.connect(DB_PATH)
+        stock_list = []
+        
+        for _, row in df.iterrows():
+            raw_code = str(row[code_col]).strip()
+            # 格式轉換：1234 -> 1234.T
+            if len(raw_code) >= 4 and raw_code[:4].isdigit():
+                symbol = f"{raw_code[:4]}.T"
+                name = str(row[name_col]) if name_col else "Unknown"
+                sector = str(row[sector_col]) if sector_col else "Unknown"
+                
+                # 💡 同步到 stock_info
+                conn.execute("INSERT OR REPLACE INTO stock_info (symbol, name, sector, updated_at) VALUES (?, ?, ?, ?)",
+                             (symbol, name, sector, datetime.now().strftime("%Y-%m-%d")))
+                stock_list.append((symbol, name))
+        
+        conn.commit()
+        conn.close()
+        log(f"✅ 成功同步日股清單: {len(stock_list)} 檔")
+        return stock_list
+    except Exception as e:
+        log(f"❌ 日股清單獲取失敗: {e}")
+        return [("7203.T", "TOYOTA MOTOR")]
+
+def download_one(args):
+    """單檔下載邏輯"""
+    symbol, name, mode = args
+    # 決定下載起點 (Hot: 2020-01-01 / Cold: 1999-01-01)
+    start_date = "2020-01-01" if mode == 'hot' else "1999-01-01"
+    
+    try:
+        time.sleep(random.uniform(0.6, 1.3))
+        tk = yf.Ticker(symbol)
+        hist = tk.history(start=start_date, timeout=30)
+        
+        if hist is None or hist.empty:
+            return {"symbol": symbol, "status": "empty"}
+            
+        hist.reset_index(inplace=True)
+        hist.columns = [c.lower() for c in hist.columns]
+        if 'date' in hist.columns:
+            # 移除時區資訊並轉為字串日期
+            hist['date'] = pd.to_datetime(hist['date']).dt.strftime('%Y-%m-%d')
+        
+        df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
+        df_final['symbol'] = symbol
+        
+        # 寫入資料庫
+        conn = sqlite3.connect(DB_PATH)
+        df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method='multi')
+        conn.close()
+        
+        return {"symbol": symbol, "status": "success"}
+    except Exception:
+        return {"symbol": symbol, "status": "error"}
+
+def run_sync(mode='hot'):
+    """執行同步主流程"""
+    start_time = time.time()
+    init_db()
+    
+    # 1. 獲取名單並同步名稱
+    items = get_jp_stock_list()
+    if not items:
+        log("❌ 無法取得名單，終止任務。")
+        return
+
+    log(f"🚀 開始下載 JP ({mode.upper()} 模式)，目標: {len(items)} 檔")
+
+    # 2. 多執行緒下載
+    stats = {"success": 0, "empty": 0, "error": 0}
+    task_args = [(it[0], it[1], mode) for it in items]
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(download_one, arg): arg for arg in task_args}
+        pbar = tqdm(total=len(items), desc=f"JP({mode})下載中")
+        
+        for f in as_completed(futures):
+            res = f.result()
+            stats[res.get("status", "error")] += 1
+            pbar.update(1)
+        pbar.close()
+
+    # 3. 資料庫優化
+    log("🧹 正在優化資料庫空間 (VACUUM)...")
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("VACUUM")
+    conn.close()
 
     duration = (time.time() - start_time) / 60
-    print(f"📊 日股處理完成，耗時 {duration:.1f} 分鐘。成功率: {rate}%")
-    
-    return download_stats
+    log(f"📊 {MARKET_CODE} 同步完成！費時: {duration:.1f} 分鐘")
+    log(f"✅ 成功: {stats['success']} | 📭 空資料: {stats['empty']} | ❌ 錯誤: {stats['error']}")
 
 if __name__ == "__main__":
-    main()
+    # 測試執行
+    run_sync(mode='hot')
