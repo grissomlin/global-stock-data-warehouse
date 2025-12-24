@@ -11,19 +11,9 @@ class StockNotifier:
             resend.api_key = self.resend_api_key
 
     def get_now_time_str(self):
+        """獲取台北時間"""
         now_utc8 = datetime.utcnow() + timedelta(hours=8)
         return now_utc8.strftime("%Y-%m-%d %H:%M:%S")
-
-    def _get_market_config(self, market):
-        """100% 恢復六國連結，絕對不漏掉任何一個市場"""
-        m = market.upper()
-        if m == 'US': return "StockCharts", "https://stockcharts.com/sc3/ui/?s=GWAV"
-        if m == 'CN': return "東方財富網 (EastMoney)", "https://quote.eastmoney.com/sh603165.html"
-        if m == 'HK': return "AASTOCKS 阿思達克", "http://www.aastocks.com/tc/stocks/quote/stocktrend.aspx?symbol=08203"
-        if m == 'TW': return "玩股網 (WantGoo)", "https://www.wantgoo.com/stock/2330"
-        if m == 'JP': return "樂天證券 (Rakuten)", "https://www.rakuten-sec.co.jp/web/market/search/quote.html?ric=2850.T"
-        if m == 'KR': return "Investing.com KR", "https://kr.investing.com/indices/kospi"
-        return "Yahoo Finance", "https://finance.yahoo.com/"
 
     def send_telegram(self, message):
         if not self.tg_token or not self.tg_chat_id: return False
@@ -35,6 +25,12 @@ class StockNotifier:
         except: return False
 
     def send_stock_report_email(self, all_summaries):
+        """
+        發送完整報告：
+        1. 拿掉所有超連結
+        2. 增加本次更新成功率
+        3. 增加失敗/異常名單摘要 (前 20 筆)
+        """
         if not self.resend_api_key: return False
         
         report_time = self.get_now_time_str()
@@ -43,9 +39,16 @@ class StockNotifier:
 
         for s in all_summaries:
             status_color = "#28a745" if s['status'] == "✅" else "#dc3545"
-            site_name, chart_url = self._get_market_config(s['market'])
             
-            # 💡 依照你要求的格式，手動展開 HTML，欄位全齊
+            # 💡 計算更新成功率 (實收/應收)
+            success_rate = (s['success'] / s['expected']) * 100 if s['expected'] > 0 else 0
+            
+            # 💡 處理失敗名單 (由 main.py 傳入，若無則顯示 '無')
+            fail_list = s.get('fail_list', [])
+            fail_summary = ", ".join(fail_list[:20]) if fail_list else "無"
+            fail_count_text = f"...等其餘 {len(fail_list)-20} 檔請查看 GitHub Log" if len(fail_list) > 20 else ""
+
+            # 💡 依照要求展開 HTML，拿掉連結，加入異常名單
             market_sections += f"""
             <div style="margin-bottom: 40px; border: 1px solid #ddd; padding: 25px; border-radius: 12px; background-color: #fff;">
                 <h2 style="margin-top: 0; color: #333; font-size: 20px;">{s['market']}股市 全方位監控報告</h2>
@@ -55,7 +58,8 @@ class StockNotifier:
                     <div style="margin-bottom: 15px;">
                         <b>應收標的</b><br><span style="font-size: 18px;">{s['expected']}</span><br>
                         <b>更新成功(含快取)</b><br><span style="font-size: 18px; color: #28a745;">{s['success']}</span><br>
-                        <b>今日覆蓋率</b><br><span style="font-size: 22px; font-weight: bold; background-color: #fff3cd; padding: 2px 8px;">{s['coverage']}</span>
+                        <b>今日覆蓋率</b><br><span style="font-size: 22px; font-weight: bold; background-color: #fff3cd; padding: 2px 8px;">{s['coverage']}</span><br>
+                        <b>本次更新成功率</b>: <span style="font-weight: bold;">{success_rate:.1f}%</span>
                     </div>
                     
                     <div style="border-top: 1px dashed #ccc; padding-top: 15px; margin-top: 15px;">
@@ -63,17 +67,20 @@ class StockNotifier:
                         <b>股票數:</b> {s['success']} | <b>總筆數:</b> <span style="color: #6f42c1; font-weight: bold;">{s['total_rows']:,}</span><br>
                         <b>名稱同步:</b> {s['names_synced']}
                     </div>
+
+                    <div style="margin-top: 20px; padding: 15px; background-color: #fff5f5; border-radius: 8px; border-left: 5px solid #dc3545;">
+                        <b style="color: #dc3545;">⚠️ 失敗/異常名單摘要 (前 20 筆):</b><br>
+                        <span style="font-family: monospace; font-size: 14px;">{fail_summary}</span><br>
+                        <small style="color: #666;">{fail_count_text}</small>
+                    </div>
                 </div>
 
-                <div style="margin-top: 20px; font-size: 13px; color: #666;">
-                    💡 提示：下方的數據報表若包含股票代號，點擊可直接跳轉至 <b>{site_name}</b> 查看該市場之即時技術線圖。
+                <div style="margin-top: 20px; font-size: 13px; color: #888; border-top: 1px solid #eee; padding-top: 10px;">
+                    💡 提示：本報告已移除外部連結。詳細下載紀錄請參閱 GitHub Actions 執行日誌。
                 </div>
-                <a href="{chart_url}" style="display: inline-block; margin-top: 10px; color: #007bff; text-decoration: none; font-weight: bold; border: 1px solid #007bff; padding: 5px 15px; border-radius: 5px;">
-                    🔗 進入 {site_name} 技術線圖
-                </a>
             </div>
             """
-            tg_brief.append(f"{s['status']} {s['market']}: {s['coverage']} (總筆數: {s['total_rows']:,})")
+            tg_brief.append(f"{s['status']} {s['market']}: {s['coverage']} (異常: {len(fail_list)}檔)")
 
         html_full = f"""
         <html>
@@ -82,7 +89,7 @@ class StockNotifier:
                 <h1 style="text-align: center; color: #333; margin-bottom: 30px;">🌍 全球股市數據倉儲監控報告</h1>
                 {market_sections}
                 <div style="font-size: 12px; color: #bbb; text-align: center; margin-top: 40px; border-top: 1px solid #eee; padding-top: 20px;">
-                    💾 熱數據庫已優化並同步至 Google Drive<br>
+                    💾 熱數據庫已優化並同步至 Google Drive | 系統狀態：OK<br>
                     此為自動發送，請勿直接回覆。
                 </div>
             </div>
@@ -102,4 +109,3 @@ class StockNotifier:
         except Exception as e:
             print(f"❌ 通報錯誤: {e}")
             return False
-
