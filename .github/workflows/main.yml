@@ -35,7 +35,6 @@ jobs:
       matrix:
         market: ${{ fromJson(needs.prepare-matrix.outputs.matrix_list) }}
     
-    # 這裡加入環境變數，讓下方的所有 steps 都能讀到 Secrets
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -56,86 +55,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install resend  # 確保安裝了 resend SDK
+          pip install resend google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-      - name: Download Market Specific DB
-        run: |
-          python -c "
-          import os, json, io
-          from google.oauth2 import service_account
-          from googleapiclient.discovery import build
-          from googleapiclient.http import MediaIoBaseDownload
-
-          market = '${{ matrix.market }}'
-          db_file = f'{market}_stock_warehouse.db'
-          folder_id = '1ltKCQ209k9MFuWV6FIxQ1coinV2fxSyl'
-          
-          env_json = os.environ.get('GDRIVE_SERVICE_ACCOUNT')
-          if not env_json:
-              print('No Secrets found.')
-              exit(0)
-          
-          info = json.loads(env_json)
-          creds = service_account.Credentials.from_service_account_info(info)
-          service = build('drive', 'v3', credentials=creds)
-          
-          query = f\"name = '{db_file}' and '{folder_id}' in parents and trashed = false\"
-          files = service.files().list(q=query, fields='files(id)').execute().get('files', [])
-          
-          if files:
-              file_id = files[0]['id']
-              print(f'Downloading {db_file}...')
-              request = service.files().get_media(fileId=file_id)
-              fh = io.FileIO(db_file, 'wb')
-              downloader = MediaIoBaseDownload(fh, request)
-              done = False
-              while not done:
-                  status, done = downloader.next_chunk()
-              print(f'Download Complete.')
-          else:
-              print(f'No existing DB for {market}.')
-          "
-
+      # 💡 修正：現在 main.py 會自己處理 .gz 的下載與解壓
+      # 我們只需要確保 main.py 正常執行即可
       - name: Run Market Update
-        id: run_update
         run: |
-          # 執行你的主程式
           python main.py ${{ matrix.market }}
 
-      # 如果成功，發送通知
-      - name: Notify Success
-        if: success()
-        run: |
-          python -c "
-          import os, requests, resend
-          
-          market = '${{ matrix.market }}'
-          msg = f'✅ 股市倉儲更新成功\n市場: {market.upper()}\n狀態: 數據已同步至 Google Drive'
-          
-          # Telegram
-          token = os.getenv('TELEGRAM_BOT_TOKEN')
-          chat_id = os.getenv('TELEGRAM_CHAT_ID')
-          requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg})
-          
-          # Resend (Email)
-          resend.api_key = os.getenv('RESEND_API_KEY')
-          resend.Emails.send({
-              'from': 'StockMonitor <onboarding@resend.dev>',
-              'to': 'grissomlin643@gmail.com', # <--- 請改為你的信箱
-              'subject': f'Success: {market.upper()} Data Warehouse Updated',
-              'html': f'<p>{msg}</p>'
-          })
-          "
-
-      # 如果失敗，發送通知
-      - name: Notify Failure
+      # 💡 修正：刪除 Notify Success 步驟
+      # 因為 main.py 內部的 StockNotifier 已經會寄發專業版報表了
+      
+      - name: Notify System Failure
         if: failure()
         run: |
           python -c "
           import os, requests
           market = '${{ matrix.market }}'
-          msg = f'❌ 股市倉儲更新失敗！\n市場: {market.upper()}\n請檢查 GitHub Actions Log。'
-          
+          msg = f'❌ 系統層級崩潰！\n市場: {market.upper()}\n請檢查 GitHub Actions 執行環境日誌。'
           token = os.getenv('TELEGRAM_BOT_TOKEN')
           chat_id = os.getenv('TELEGRAM_CHAT_ID')
           requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg})
