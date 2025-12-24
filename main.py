@@ -21,7 +21,7 @@ except ImportError:
 import downloader_tw, downloader_us, downloader_cn, downloader_hk, downloader_jp, downloader_kr
 
 # ========== 核心參數設定 ==========
-# 您提供的 Folder ID：https://drive.google.com/drive/folders/1ltKCQ209k9MFuWV6FIxQ1coinV2fxSyl
+# 您提供的 Folder ID: https://drive.google.com/drive/folders/1ltKCQ209k9MFuWV6FIxQ1coinV2fxSyl
 GDRIVE_FOLDER_ID = '1ltKCQ209k9MFuWV6FIxQ1coinV2fxSyl' 
 SERVICE_ACCOUNT_FILE = 'citric-biplane-319514-75fead53b0f5.json'
 AUDIT_DB_PATH = "data_warehouse_audit.db"
@@ -54,7 +54,8 @@ def get_drive_service():
 def download_backup_from_drive(service, file_name):
     """從雲端下載 .db.gz 並儲存至本地"""
     query = f"name = '{file_name}' and '{GDRIVE_FOLDER_ID}' in parents and trashed = false"
-    results = service.files().list(q=query, fields="files(id)").execute(num_retries=3)
+    # 搜尋時必須包含 supportsAllDrives 以查看共用資料夾
+    results = service.files().list(q=query, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute(num_retries=3)
     items = results.get('files', [])
     
     if not items:
@@ -108,24 +109,26 @@ def optimize_and_compress(db_file):
         return None
 
 def upload_to_drive(service, file_path):
-    """將 .db.gz 上傳至 Google Drive (修正 Quota 與 Parents 邏輯)"""
+    """將 .db.gz 上傳至 Google Drive (修正 Quota 與權限問題)"""
     file_name = os.path.basename(file_path)
-    # 使用 resumable upload 處理大檔案
     media = MediaFileUpload(file_path, mimetype='application/gzip', resumable=True, chunksize=10*1024*1024)
     
     try:
-        # 1. 搜尋該資料夾下是否已有同名檔案
+        # 1. 搜尋檔案 (確保包含共用雲端硬碟參數)
         query = f"name = '{file_name}' and '{GDRIVE_FOLDER_ID}' in parents and trashed = false"
-        results = service.files().list(q=query, fields="files(id)").execute(num_retries=3)
+        results = service.files().list(
+            q=query, 
+            fields="files(id)", 
+            supportsAllDrives=True, 
+            includeItemsFromAllDrives=True
+        ).execute(num_retries=3)
         items = results.get('files', [])
         
         if items:
-            # ✅ 更新既有檔案 (不會消耗 Service Account 配額)
             file_id = items[0]['id']
             print(f"🔄 正在更新雲端檔案: {file_name} (ID: {file_id})")
             request = service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True)
         else:
-            # ✅ 建立新檔案 (必須指定 parents 才能使用您的個人帳號配額)
             print(f"🆕 正在建立新檔案: {file_name} 在資料夾 {GDRIVE_FOLDER_ID}")
             file_metadata = {
                 'name': file_name, 
@@ -133,15 +136,21 @@ def upload_to_drive(service, file_path):
             }
             request = service.files().create(body=file_metadata, media_body=media, fields='id', supportsAllDrives=True)
 
+        # 2. 執行 resumable chunked upload
         response = None
         while response is None:
             status, response = request.next_chunk(num_retries=5)
             if status:
                 print(f"📤 上傳進度: {int(status.progress() * 100)}%")
-        return True
+        
+        if response and 'id' in response:
+            return True
+        else:
+            raise Exception("API 上傳完成但未回傳 ID")
+            
     except Exception as e:
-        # 拋出詳細錯誤，由 main 捕獲並寫入報表
-        raise Exception(f"Google Drive API 錯誤: {str(e)}")
+        # 💡 使用 repr 確保錯誤訊息在 Email 報表中不為空
+        raise Exception(repr(e))
 
 # ========== 主程式執行區塊 ==========
 
@@ -165,7 +174,7 @@ def main():
         try:
             print(f"\n--- 🌍 市場啟動: {m.upper()} ---")
 
-            # 1. 恢復備份
+            # 1. 嘗試恢復備份
             if not os.path.exists(db_file):
                 if download_backup_from_drive(service, gz_file):
                     decompress_db(gz_file)
@@ -186,29 +195,29 @@ def main():
             if success_count > 0:
                 final_gz = optimize_and_compress(db_file)
                 
-                # 嘗試同步雲端
                 try:
                     if final_gz:
                         upload_to_drive(service, final_gz)
                         os.remove(final_gz)
                     sync_status = "✅ 雲端同步成功"
                 except Exception as sync_err:
-                    sync_status = f"❌ 雲端同步失敗 ({str(sync_err)})"
+                    # 💡 確保錯誤細節可以顯示在 HTML 中
+                    err_detail = str(sync_err).replace('<', '[').replace('>', ']')
+                    sync_status = f"❌ 雲端同步失敗 (原因: {err_detail})"
                 
-                # 組合報告備註
                 health_note = f"{sync_status}<br>"
                 if m in EXPECTED_MIN_ROWS and success_count < EXPECTED_MIN_ROWS[m]:
-                    health_note += f"⚠️ <b>[資料異常]</b> 更新家數 ({success_count}) 低於門檻 ({EXPECTED_MIN_ROWS[m]})！"
+                    health_note += f"⚠️ <b>[資料數量異常]</b> 更新家數 ({success_count}) 低於門檻 ({EXPECTED_MIN_ROWS[m]})！"
                 else:
                     health_note += "✅ 數據完整度良好。"
                 
-                # 寄送新版格式報表
+                # 唯一發信出口
                 notifier.send_stock_report(m.upper(), None, pd.DataFrame(), health_note, stats)
             else:
-                notifier.send_telegram(f"❌ {m.upper()} 今日無數據更新。")
+                notifier.send_telegram(f"❌ {m.upper()} 今日無新數據。")
+                if os.path.exists(db_file): os.remove(db_file)
 
         except Exception as e:
-            # 系統級崩潰
             err_msg = f"❌ {m.upper()} 系統崩潰: {str(e)}"
             print(err_msg)
             notifier.send_telegram(err_msg)
