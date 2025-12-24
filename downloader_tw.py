@@ -1,3 +1,6 @@
+
+
+台股修改後提供完整版
 # -*- coding: utf-8 -*-
 import time, random, requests
 import pandas as pd
