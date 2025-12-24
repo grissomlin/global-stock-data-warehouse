@@ -15,18 +15,14 @@ class StockNotifier:
         return now_utc8.strftime("%Y-%m-%d %H:%M:%S")
 
     def _get_market_config(self, market):
-        """完全恢復你指定的跳轉連結，不亂改"""
+        """100% 恢復六國連結，絕對不漏掉任何一個市場"""
         m = market.upper()
-        if m == 'US': 
-            return "StockCharts", "https://stockcharts.com/sc3/ui/?s=GWAV"
-        if m == 'CN': 
-            return "東方財富網 (EastMoney)", "https://quote.eastmoney.com/sh603165.html"
-        if m == 'HK': 
-            return "AASTOCKS 阿思達克", "http://www.aastocks.com/tc/stocks/quote/stocktrend.aspx?symbol=08203"
-        if m == 'TW': 
-            return "玩股網 (WantGoo)", "https://www.wantgoo.com/stock/2330"
-        if m == 'JP': 
-            return "樂天證券 (Rakuten)", "https://www.rakuten-sec.co.jp/web/market/search/quote.html?ric=2850.T"
+        if m == 'US': return "StockCharts", "https://stockcharts.com/sc3/ui/?s=GWAV"
+        if m == 'CN': return "東方財富網 (EastMoney)", "https://quote.eastmoney.com/sh603165.html"
+        if m == 'HK': return "AASTOCKS 阿思達克", "http://www.aastocks.com/tc/stocks/quote/stocktrend.aspx?symbol=08203"
+        if m == 'TW': return "玩股網 (WantGoo)", "https://www.wantgoo.com/stock/2330"
+        if m == 'JP': return "樂天證券 (Rakuten)", "https://www.rakuten-sec.co.jp/web/market/search/quote.html?ric=2850.T"
+        if m == 'KR': return "Investing.com KR", "https://kr.investing.com/indices/kospi"
         return "Yahoo Finance", "https://finance.yahoo.com/"
 
     def send_telegram(self, message):
@@ -39,10 +35,6 @@ class StockNotifier:
         except: return False
 
     def send_stock_report_email(self, all_summaries):
-        """
-        發送 HTML 專業報表。
-        格式包含：應收標的、更新成功、今日覆蓋率、狀態、最新日期、股票數、總筆數、名稱同步。
-        """
         if not self.resend_api_key: return False
         
         report_time = self.get_now_time_str()
@@ -53,7 +45,7 @@ class StockNotifier:
             status_color = "#28a745" if s['status'] == "✅" else "#dc3545"
             site_name, chart_url = self._get_market_config(s['market'])
             
-            # 💡 依照你要求的格式，手動展開 HTML，絕對不簡化
+            # 💡 依照你要求的格式，手動展開 HTML，欄位全齊
             market_sections += f"""
             <div style="margin-bottom: 40px; border: 1px solid #ddd; padding: 25px; border-radius: 12px; background-color: #fff;">
                 <h2 style="margin-top: 0; color: #333; font-size: 20px;">{s['market']}股市 全方位監控報告</h2>
