@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-import os, sys, sqlite3, json, time, gzip, shutil, socket
+import os, sys, sqlite3, json, time, gzip, shutil, socket, io
 import pandas as pd
 from datetime import datetime, timedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-import io
 
-# 💡 增加全域連線逾時，確保大檔案傳輸穩定
+# 💡 增加全域連線逾時，確保大檔案傳輸穩定 (10分鐘)
 socket.setdefaulttimeout(600)
 
 # 導入通知與環境變數載入工具
@@ -26,7 +25,7 @@ GDRIVE_FOLDER_ID = '1ltKCQ209k9MFuWV6FIxQ1coinV2fxSyl'
 SERVICE_ACCOUNT_FILE = 'citric-biplane-319514-75fead53b0f5.json'
 AUDIT_DB_PATH = "data_warehouse_audit.db"
 
-# 📊 數量門檻預警
+# 📊 數量門檻預警設定
 EXPECTED_MIN_ROWS = {
     'tw': 900, 'us': 4000, 'cn': 4500, 'hk': 1500, 'jp': 3000, 'kr': 2000
 }
@@ -34,20 +33,25 @@ EXPECTED_MIN_ROWS = {
 notifier = StockNotifier()
 
 def get_drive_service():
+    """初始化 Google Drive API 服務"""
     env_json = os.environ.get('GDRIVE_SERVICE_ACCOUNT')
-    if env_json:
-        info = json.loads(env_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/drive'])
-    elif os.path.exists(SERVICE_ACCOUNT_FILE):
-        creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=['https://www.googleapis.com/auth/drive'])
-    else:
+    try:
+        if env_json:
+            info = json.loads(env_json)
+            creds = service_account.Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/drive'])
+        elif os.path.exists(SERVICE_ACCOUNT_FILE):
+            creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=['https://www.googleapis.com/auth/drive'])
+        else:
+            return None
+        return build('drive', 'v3', credentials=creds, cache_discovery=False)
+    except Exception as e:
+        print(f"❌ 無法初始化 Drive 服務: {e}")
         return None
-    return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
-# ========== 雲端與磁碟維護函式 ==========
+# ========== 雲端與磁碟維護核心邏輯 ==========
 
 def download_backup_from_drive(service, file_name):
-    """從雲端下載 .db.gz 檔案"""
+    """從雲端下載 .db.gz 並儲存至本地"""
     query = f"name = '{file_name}' and '{GDRIVE_FOLDER_ID}' in parents and trashed = false"
     results = service.files().list(q=query, fields="files(id)").execute(num_retries=3)
     items = results.get('files', [])
@@ -62,28 +66,28 @@ def download_backup_from_drive(service, file_name):
     downloader = MediaIoBaseDownload(fh, request, chunksize=10*1024*1024)
     
     done = False
-    while done is False:
+    while not done:
         status, done = downloader.next_chunk(num_retries=5)
         if status:
             print(f"📥 下載進度: {int(status.progress() * 100)}%")
     return True
 
 def decompress_db(gz_file):
-    """解壓縮並移除壓縮檔以節省空間"""
+    """解壓縮 .gz 為 .db 並立即刪除壓縮檔釋放空間"""
     db_file = gz_file.replace('.gz', '')
     try:
         print(f"🔓 正在解壓 {gz_file}...")
         with gzip.open(gz_file, 'rb') as f_in:
             with open(db_file, 'wb') as f_out:
                 shutil.copyfileobj(f_in, f_out)
-        os.remove(gz_file) # 💡 關鍵：立即刪除壓縮檔釋放空間
+        os.remove(gz_file) # 💡 釋放 GitHub Actions 空間
         return True
     except Exception as e:
         print(f"❌ 解壓失敗: {e}")
         return False
 
 def optimize_and_compress(db_file):
-    """優化 SQLite 並壓縮，隨後移除原始檔"""
+    """SQLite 優化與 GZIP 壓縮，並清理原始檔"""
     gz_file = f"{db_file}.gz"
     try:
         print(f"🧹 執行 VACUUM 優化 {db_file}...")
@@ -96,15 +100,14 @@ def optimize_and_compress(db_file):
             with gzip.open(gz_file, 'wb', compresslevel=6) as f_out:
                 shutil.copyfileobj(f_in, f_out)
         
-        # 💡 關鍵：壓縮成功後立即刪除原始 .db 檔案，為上傳流程騰出空間
-        os.remove(db_file) 
+        os.remove(db_file) # 💡 壓縮完畢立即刪除數 GB 的原始檔
         return gz_file
     except Exception as e:
         print(f"❌ 壓縮失敗: {e}")
         return None
 
 def upload_to_drive(service, file_path):
-    """上傳 .db.gz 到雲端"""
+    """將 .db.gz 上傳/更新至 Google Drive"""
     file_name = os.path.basename(file_path)
     media = MediaFileUpload(file_path, mimetype='application/octet-stream', resumable=True, chunksize=10*1024*1024)
     
@@ -125,7 +128,7 @@ def upload_to_drive(service, file_path):
             print(f"📤 上傳進度: {int(status.progress() * 100)}%")
     return True
 
-# ========== 主程式邏輯 ==========
+# ========== 主程式執行區塊 ==========
 
 def main():
     target_market = sys.argv[1].lower() if len(sys.argv) > 1 else None
@@ -137,16 +140,16 @@ def main():
 
     service = get_drive_service()
     if not service:
-        print("❌ 無法啟動 Google Drive 服務")
+        print("❌ 錯誤：無法啟動 Drive 服務，請檢查認證金鑰。")
         return
 
     for m in markets_to_run:
+        db_file = f"{m}_stock_warehouse.db"
+        gz_file = f"{db_file}.gz"
         try:
-            db_file = f"{m}_stock_warehouse.db"
-            gz_file = f"{db_file}.gz"
-            print(f"\n--- 🌍 市場任務啟動: {m.upper()} ---")
+            print(f"\n--- 🌍 市場啟動: {m.upper()} ---")
 
-            # 1. 嘗試恢復備份
+            # 1. 恢復備份邏輯
             if not os.path.exists(db_file):
                 if download_backup_from_drive(service, gz_file):
                     decompress_db(gz_file)
@@ -158,32 +161,38 @@ def main():
                         PRIMARY KEY (date, symbol, market))''')
                     conn.close()
 
-            # 2. 執行增量下載
+            # 2. 執行模組下載
             target_module = module_map.get(m)
             stats = target_module.main() 
             
-            # 3. 處理完成後的封裝與上傳
+            # 3. 通知與雲端封存
             success_count = stats.get('success', 0)
             if success_count > 0:
+                # 封裝：優化 + 壓縮 + 刪除原始檔
                 final_gz = optimize_and_compress(db_file)
                 if final_gz:
                     upload_to_drive(service, final_gz)
-                    os.remove(final_gz) # 💡 最終清理
+                    os.remove(final_gz) # 最終磁碟清理
                 
+                # 健康度檢查
                 health_note = "✅ 數據完整度良好。"
                 if m in EXPECTED_MIN_ROWS and success_count < EXPECTED_MIN_ROWS[m]:
-                    health_note = f"⚠️ <b>[警告]</b> 數量 ({success_count}) 低於門檻!"
+                    health_note = f"⚠️ <b>[資料異常預警]</b> 更新數量 ({success_count}) 低於門檻 ({EXPECTED_MIN_ROWS[m]})！"
                 
+                # 唯一報表發送點
                 notifier.send_stock_report(m.upper(), None, pd.DataFrame(), health_note, stats)
+                
             else:
-                notifier.send_telegram(f"❌ {m.upper()} 今日無更新。")
+                notifier.send_telegram(f"❌ {m.upper()} 今日無新數據更新。")
                 if os.path.exists(db_file): os.remove(db_file)
 
         except Exception as e:
-            notifier.send_telegram(f"❌ {m.upper()} 崩潰: {str(e)}")
+            err_detail = f"❌ {m.upper()} 系統崩潰: {str(e)}"
+            print(err_detail)
+            notifier.send_telegram(err_detail)
             if os.path.exists(db_file): os.remove(db_file)
     
-    print("\n✨ 任務結束")
+    print("\n✨ 所有市場任務已完成。")
 
 if __name__ == "__main__":
     main()
