@@ -6,15 +6,23 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# ========== 參數與路徑設定 ==========
+# ========== 1. 環境判斷與參數設定 ==========
 MARKET_CODE = "hk-share"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# 💡 指向您的核心資料庫
 DB_PATH = os.path.join(BASE_DIR, "hk_stock_warehouse.db")
 
-# ✅ 效能與穩定性設定
-MAX_WORKERS = 4 
-DATA_EXPIRY_SECONDS = 3600
+# 💡 自動判斷是否為 GitHub Actions 環境 (關鍵功能：不刪除)
+IS_GITHUB_ACTIONS = os.getenv('GITHUB_ACTIONS') == 'true'
+
+# ✅ 快取設定 (本機回測專用)
+CACHE_DIR = os.path.join(BASE_DIR, "cache_hk")
+DATA_EXPIRY_SECONDS = 3600  # 本機跑時，1小時內視為有效快取
+
+if not IS_GITHUB_ACTIONS and not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
+
+# ✅ 效能設定
+MAX_WORKERS = 2 if IS_GITHUB_ACTIONS else 4 
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
@@ -52,7 +60,7 @@ def init_db():
 
 def get_hk_stock_list():
     """從 HKEX 獲取清單並同步寫入 stock_info"""
-    log("📡 正在從港交所 (HKEX) 獲取最新名單與名稱...")
+    log(f"📡 正在獲取最新名單... (環境: {'GitHub' if IS_GITHUB_ACTIONS else 'Local'})")
     url = "https://www.hkex.com.hk/-/media/HKEX-Market/Services/Trading/Securities/Securities-Lists/Securities-Using-Standard-Transfer-Form-(including-GEM)-By-Stock-Code-Order/secstkorder.xls"
     
     try:
@@ -60,7 +68,6 @@ def get_hk_stock_list():
         r.raise_for_status()
         df_raw = pd.read_excel(io.BytesIO(r.content), header=None)
         
-        # 定位表頭
         hdr_idx = 0
         for row_i in range(20):
             row_str = "".join([str(x) for x in df_raw.iloc[row_i]]).lower()
@@ -82,7 +89,6 @@ def get_hk_stock_list():
             if classify_security(name) == "Common Stock":
                 symbol = to_symbol_yf(row[col_code])
                 if symbol:
-                    # 💡 同步名稱到 stock_info
                     conn.execute("INSERT OR REPLACE INTO stock_info (symbol, name, updated_at) VALUES (?, ?, ?)",
                                  (symbol, name, datetime.now().strftime("%Y-%m-%d")))
                     stock_list.append((symbol, name))
@@ -96,11 +102,24 @@ def get_hk_stock_list():
         return [("0700.HK", "TENCENT"), ("9988.HK", "BABA")]
 
 def download_one(args):
-    """單檔下載邏輯"""
+    """具備環境偵測與快取機制的單檔下載邏輯"""
     symbol, name, mode = args
+    csv_path = os.path.join(CACHE_DIR, f"{symbol}.csv")
     start_date = "2020-01-01" if mode == 'hot' else "1990-01-01"
     
+    # --- 💡 步驟 1: 判斷是否使用 CSV 快取 (僅限本地環境) ---
+    use_cache = False
+    if not IS_GITHUB_ACTIONS and os.path.exists(csv_path):
+        file_age = time.time() - os.path.getmtime(csv_path)
+        if file_age < DATA_EXPIRY_SECONDS:
+            use_cache = True
+
     try:
+        if use_cache:
+            # 本機模式：直接從 CSV 讀取，不發送網路請求
+            return {"symbol": symbol, "status": "cache"}
+        
+        # --- 💡 步驟 2: 下載邏輯 ---
         time.sleep(random.uniform(0.8, 2.0))
         tk = yf.Ticker(symbol)
         hist = tk.history(start=start_date, timeout=30)
@@ -116,10 +135,14 @@ def download_one(args):
         df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
         df_final['symbol'] = symbol
         
+        # 寫入資料庫 (無論哪種環境都要進 DB)
         conn = sqlite3.connect(DB_PATH)
-        # 💡 使用增量寫入，重複的部分由 SQL 處理或在此處過濾
         df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method='multi')
         conn.close()
+
+        # 如果是本地環境，下載完存成 CSV 方便回測
+        if not IS_GITHUB_ACTIONS:
+            df_final.to_csv(csv_path, index=False)
         
         return {"symbol": symbol, "status": "success"}
     except Exception:
@@ -136,15 +159,15 @@ def run_sync(mode='hot'):
         log("❌ 無法取得名單，終止任務。")
         return
 
-    log(f"🚀 開始下載 HK ({mode.upper()} 模式)，目標: {len(items)} 檔")
+    log(f"🚀 開始執行 HK ({mode.upper()} 模式)，目標: {len(items)} 檔")
 
-    # 2. 多執行緒下載
-    stats = {"success": 0, "empty": 0, "error": 0}
+    # 2. 多執行緒下載/讀取
+    stats = {"success": 0, "cache": 0, "empty": 0, "error": 0}
     task_args = [(it[0], it[1], mode) for it in items]
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(download_one, arg): arg for arg in task_args}
-        pbar = tqdm(total=len(items), desc=f"HK({mode})下載中")
+        pbar = tqdm(total=len(items), desc=f"HK處理進度({mode})")
         
         for f in as_completed(futures):
             res = f.result()
@@ -160,8 +183,7 @@ def run_sync(mode='hot'):
 
     duration = (time.time() - start_time) / 60
     log(f"📊 {MARKET_CODE} 同步完成！費時: {duration:.1f} 分鐘")
-    log(f"✅ 成功: {stats['success']} | 📭 空資料: {stats['empty']} | ❌ 錯誤: {stats['error']}")
+    log(f"✅ 新增: {stats['success']} | ⚡ 快取: {stats['cache']} | 📭 空資料: {stats['empty']} | ❌ 錯誤: {stats['error']}")
 
 if __name__ == "__main__":
-    # 測試執行：預設 hot 模式
     run_sync(mode='hot')
