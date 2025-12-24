@@ -1,3 +1,6 @@
+
+
+韓國修改後提供完整版
 # -*- coding: utf-8 -*-
 import os, sys, time, random, subprocess
 import pandas as pd
