@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 import os, sys, sqlite3, json, time, socket, io
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
-# 💡 增加連線逾時，確保大檔案傳輸穩定
+# 💡 增加連線逾時與全域設定
 socket.setdefaulttimeout(600)
 GDRIVE_FOLDER_ID = '1ltKCQ209k9MFuWV6FIxQ1coinV2fxSyl' 
 SERVICE_ACCOUNT_FILE = 'citric-biplane-319514-75fead53b0f5.json'
@@ -19,11 +19,12 @@ except ImportError:
 
 import downloader_tw, downloader_us, downloader_cn, downloader_hk, downloader_jp, downloader_kr
 
+# 📊 應收標的門檻 (依據你的需求精確設定)
 EXPECTED_MIN_STOCKS = {
-    'tw': 900, 'us': 4000, 'cn': 4500, 'hk': 1500, 'jp': 3000, 'kr': 2000
+    'tw': 900, 'us': 4000, 'cn': 5496, 'hk': 1500, 'jp': 3000, 'kr': 2000
 }
 
-# ========== 1. 強韌的 Google Drive 函式 (加入重試機制) ==========
+# ========== 1. Google Drive 傳輸核心 (含重試機制) ==========
 
 def get_drive_service():
     env_json = os.environ.get('GDRIVE_SERVICE_ACCOUNT')
@@ -41,87 +42,84 @@ def get_drive_service():
         return None
 
 def download_db_from_drive(service, file_name, retries=3):
-    """直接下載 .db 檔案，失敗會自動重試"""
     query = f"name = '{file_name}' and '{GDRIVE_FOLDER_ID}' in parents and trashed = false"
-    
     for attempt in range(retries):
         try:
             results = service.files().list(q=query, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
             items = results.get('files', [])
-            if not items:
-                print(f"ℹ️ 雲端尚無備份檔: {file_name}")
-                return False
-
+            if not items: return False
             file_id = items[0]['id']
-            print(f"📡 正在下載雲端數據 ({attempt+1}/{retries}): {file_name}...")
-            
+            print(f"📡 下載雲端數據 ({attempt+1}/{retries}): {file_name}")
             request = service.files().get_media(fileId=file_id)
             fh = io.FileIO(file_name, 'wb')
             downloader = MediaIoBaseDownload(fh, request, chunksize=5*1024*1024)
-            
             done = False
             while not done:
                 status, done = downloader.next_chunk()
-            print(f"✅ 下載完成: {file_name}")
             return True
         except Exception as e:
-            print(f"⚠️ 下載嘗試 {attempt+1} 失敗: {e}")
+            print(f"⚠️ 下載失敗 ({attempt+1}): {e}")
             time.sleep(5)
     return False
 
 def upload_db_to_drive(service, file_path, retries=3):
-    """直接上傳 .db 檔案，並覆蓋舊版"""
     file_name = os.path.basename(file_path)
-    # 使用 resumable=True 處理較大檔案
     media = MediaFileUpload(file_path, mimetype='application/x-sqlite3', resumable=True)
-    
     query = f"name = '{file_name}' and '{GDRIVE_FOLDER_ID}' in parents and trashed = false"
-    
     for attempt in range(retries):
         try:
             results = service.files().list(q=query, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
             items = results.get('files', [])
-
             if items:
-                file_id = items[0]['id']
-                print(f"🔄 正在更新雲端檔案 ({attempt+1}/{retries}): {file_name}")
-                service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+                service.files().update(fileId=items[0]['id'], media_body=media, supportsAllDrives=True).execute()
             else:
-                print(f"🆕 正在建立雲端檔案 ({attempt+1}/{retries}): {file_name}")
-                file_metadata = {'name': file_name, 'parents': [GDRIVE_FOLDER_ID]}
-                service.files().create(body=file_metadata, media_body=media, supportsAllDrives=True).execute()
+                meta = {'name': file_name, 'parents': [GDRIVE_FOLDER_ID]}
+                service.files().create(body=meta, media_body=media, supportsAllDrives=True).execute()
             print(f"✅ 上傳完成: {file_name}")
             return True
         except Exception as e:
-            print(f"⚠️ 上傳嘗試 {attempt+1} 失敗: {e}")
+            print(f"⚠️ 上傳失敗 ({attempt+1}): {e}")
             time.sleep(5)
     return False
 
-# ========== 2. 數據倉庫維護與統計 ==========
+# ========== 2. 數據統計與優化邏輯 (恢復覆蓋率計算) ==========
 
 def optimize_db(db_file):
-    """僅執行 VACUUM，不壓縮"""
     try:
-        print(f"🧹 正在優化資料庫結構: {db_file}")
         conn = sqlite3.connect(db_file)
         conn.execute("VACUUM")
         conn.close()
-    except Exception as e:
-        print(f"⚠️ 優化失敗: {e}")
+    except: pass
 
-def get_db_summary(db_path):
+def get_db_summary(db_path, market_id):
+    """計算包含應收標的、實收標的、覆蓋率的詳細統計"""
     try:
         conn = sqlite3.connect(db_path)
+        # 統計實收標的 (今日有資料的股票數)
         df_stats = pd.read_sql("SELECT COUNT(DISTINCT symbol) as s, MAX(date) as d2, COUNT(*) as t FROM stock_prices", conn)
+        # 統計公司名稱同步數
         info_count = conn.execute("SELECT COUNT(*) FROM stock_info").fetchone()[0]
         conn.close()
-        return {
-            "stocks": df_stats['s'][0], "end": df_stats['d2'][0],
-            "total": df_stats['t'][0], "names": info_count, "file": os.path.basename(db_path)
-        }
-    except: return None
 
-# ========== 3. 主程式執行邏輯 ==========
+        success_count = int(df_stats['s'][0])
+        expected = EXPECTED_MIN_STOCKS.get(market_id, 1)
+        coverage = (success_count / expected) * 100
+
+        return {
+            "market": market_id.upper(),
+            "expected": expected,          # 應收標的
+            "success": success_count,      # 更新成功
+            "coverage": f"{coverage:.1f}%", # 今日覆蓋率
+            "end_date": df_stats['d2'][0],
+            "total_rows": df_stats['t'][0],
+            "names_synced": info_count,
+            "status": "✅" if coverage >= 90 else "⚠️"
+        }
+    except Exception as e:
+        print(f"⚠️ 統計失敗 {market_id}: {e}")
+        return None
+
+# ========== 3. 主程式執行與多管道通知 ==========
 
 def main():
     target_market = sys.argv[1].lower() if len(sys.argv) > 1 else None
@@ -134,36 +132,41 @@ def main():
     service = get_drive_service()
     if not service: return
 
+    all_summaries = []
+
     for m in markets_to_run:
         db_file = f"{m}_stock_warehouse.db"
-        print(f"\n--- 🚀 [Warehouse] 市場啟動: {m.upper()} ---")
+        print(f"\n--- 🌍 市場任務啟動: {m.upper()} ---")
 
-        # A. 直接下載 .db (無解壓)
+        # 1. 雲端同步
         if not os.path.exists(db_file):
             download_db_from_drive(service, db_file)
 
-        # B. 下載新數據
+        # 2. 執行各國下載模組
         target_module = module_map.get(m)
         target_module.run_sync(mode='hot') 
 
-        # C. 數據統計
-        summary = get_db_summary(db_file)
-        if summary and notifier:
-            health = "✅" if summary['stocks'] >= EXPECTED_MIN_STOCKS.get(m, 0) else "⚠️"
-            msg = (f"📈 <b>{m.upper()} 倉庫監控</b>\n"
-                   f"狀態: {health} | 最新日期: {summary['end']}\n"
-                   f"股票數: {summary['stocks']} | 總筆數: {summary['total']}\n"
-                   f"名稱同步: {summary['names']}")
-            notifier.send_telegram(msg)
+        # 3. 產出詳細統計
+        summary = get_db_summary(db_file, m)
+        if summary:
+            all_summaries.append(summary)
+            # 發送 Telegram (快速預覽)
+            if notifier:
+                tg_msg = (f"市場: {summary['market']}\n"
+                          f"狀態: {summary['status']} | 日期: {summary['end_date']}\n"
+                          f"覆蓋率: {summary['coverage']} ({summary['success']}/{summary['expected']})")
+                notifier.send_telegram(tg_msg)
 
-        # D. 優化並直接上傳 (無壓縮)
+        # 4. 資料庫優化與上傳
         optimize_db(db_file)
         upload_db_to_drive(service, db_file)
-        
-        # 💡 如果是在 GitHub Actions 跑，可以考慮刪除本地 db 釋放空間，但 db 很小不刪也行
-        # os.remove(db_file)
 
-    print("\n✨ 全球數據倉庫同步任務圓滿結束")
+    # 💡 5. 發送完整 Email 報表 (包含覆蓋率、跳轉連結、所有統計數據)
+    if notifier and all_summaries:
+        print("\n📧 正在發送完整 Email 報表...")
+        notifier.send_stock_report_email(all_summaries)
+
+    print("\n✨ 全球數據倉庫任務執行完畢")
 
 if __name__ == "__main__":
     main()
