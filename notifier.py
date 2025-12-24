@@ -7,9 +7,6 @@ from datetime import datetime, timedelta
 
 class StockNotifier:
     def __init__(self):
-        """
-        初始化通知模組，自動從環境變數讀取金鑰
-        """
         self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
         self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID")
         self.resend_api_key = os.getenv("RESEND_API_KEY")
@@ -18,16 +15,10 @@ class StockNotifier:
             resend.api_key = self.resend_api_key
 
     def get_now_time_str(self):
-        """
-        獲取台北時間 (UTC+8) 字串，修正 GitHub Actions 預設時區
-        """
         now_utc8 = datetime.utcnow() + timedelta(hours=8)
         return now_utc8.strftime("%Y-%m-%d %H:%M:%S")
 
     def send_telegram(self, message):
-        """
-        發送 Telegram 即時通知與警報
-        """
         if not self.tg_token or not self.tg_chat_id:
             return False
         
@@ -47,37 +38,32 @@ class StockNotifier:
             return False
 
     def send_stock_report(self, market_name, img_data, report_df, text_reports, stats=None):
-        """
-        核心報表發送：支援下載/轉換統計與失敗名單摘要
-        """
         if not self.resend_api_key:
             return False
 
         report_time = self.get_now_time_str()
         
-        # 1. 解析統計數據
-        total = stats.get('total', 'N/A') if stats else 'N/A'
-        success = stats.get('success', 0) if stats else len(report_df)
-        fail = stats.get('fail', 0) if stats else 0
-        fail_list = stats.get('fail_list', []) if stats else []
+        stats = stats or {}
+        total = stats.get('total', 'N/A')
+        success = stats.get('success', 0)
+        fail = stats.get('fail', 0)
+        fail_list = stats.get('fail_list', [])
         
         success_rate = "0%"
         if isinstance(total, int) and total > 0:
             success_rate = f"{(success / total * 100):.1f}%"
 
-        # 2. 建立失敗名單 HTML 摘要
         fail_html = ""
         if fail_list:
             display_fails = fail_list[:20]
             fail_html = f"""
             <div style="margin-top: 20px; padding: 15px; background-color: #fff4f4; border-left: 5px solid #dc3545;">
                 <strong style="color: #dc3545;">⚠️ 失敗名單摘要 (前 20 筆):</strong><br>
-                <code>{", ".join(display_fails)}</code>
+                <code>{", ".join(map(str, display_fails))}</code>
                 {"<br>...等其餘股票請查看日誌" if len(fail_list) > 20 else ""}
             </div>
             """
 
-        # 3. 構建郵件主體
         subject = f"📊 {market_name} 監控報表 - {report_time.split(' ')[0]}"
         html_content = f"""
         <html>
@@ -101,7 +87,6 @@ class StockNotifier:
         </html>
         """
 
-        # 4. 發送郵件與 Telegram 摘要
         try:
             resend.Emails.send({
                 "from": "StockMatrix <onboarding@resend.dev>",
@@ -113,7 +98,7 @@ class StockNotifier:
             tg_msg = (
                 f"📊 <b>{market_name} 監控報表</b>\n"
                 f"成功率: {success_rate}\n"
-                f"更新: {success) 檔 / 失敗: {fail} 檔"
+                f"更新: {success} 檔 / 失敗: {fail} 檔"
             )
             self.send_telegram(tg_msg)
             return True
