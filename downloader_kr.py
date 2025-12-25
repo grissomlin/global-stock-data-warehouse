@@ -22,67 +22,57 @@ def log(msg: str):
 
 # ========== 2. 從 KRX MDCSTAT01801 抓取「產業分類」==========
 def fetch_sector_mapping():
-    """回傳 dict: {stock_code (6碼): sector_name}"""
-    log("📡 正在從 KRX MDCSTAT01801 抓取產業分類...")
-    try:
-        today_str = datetime.today().strftime("%Y%m%d")
-        otp_url = "http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd"
-        dn_url = "http://data.krx.co.kr/comm/fileDn/download_csv/download.cmd"
+    """回傳 dict: {stock_code (6碼): sector_name}，自動使用最近交易日"""
+    log("📡 正在從 KRX MDCSTAT01801 抓取產業分類（自動尋找最近交易日）...")
+    
+    # 從今天往前試最多 7 天（跳過週末）
+    for days_back in range(0, 7):
+        query_date = datetime.today() - pd.Timedelta(days=days_back)
+        date_str = query_date.strftime("%Y%m%d")
+        weekday = query_date.weekday()  # Mon=0, ..., Sun=6
         
-        otp_params = {
-            'locale': 'ko_KR',
-            'mktId': 'ALL',
-            'trdDd': today_str,
-            'money': '1',
-            'csvxls_isNo': 'false',
-            'name': 'fileDown',
-            'url': 'dbms/MDC/STAT/standard/MDCSTAT01801'
-        }
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201030201'
-        }
+        if weekday >= 5:  # 跳過週六日
+            continue
 
-        time.sleep(1)
-        r_otp = requests.post(otp_url, data=otp_params, headers=headers, timeout=15)
-        r_otp.raise_for_status()
-        otp = r_otp.text.strip()
+        try:
+            otp_url = "http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd"
+            dn_url = "http://data.krx.co.kr/comm/fileDn/download_csv/download.cmd"
+            
+            otp_params = {
+                'locale': 'ko_KR',
+                'mktId': 'ALL',
+                'trdDd': date_str,
+                'money': '1',
+                'csvxls_isNo': 'false',
+                'name': 'fileDown',
+                'url': 'dbms/MDC/STAT/standard/MDCSTAT01801'
+            }
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201030201'
+            }
 
-        r_csv = requests.post(dn_url, data={'code': otp}, headers=headers, timeout=20)
-        r_csv.encoding = 'cp949'
+            time.sleep(1 + random.uniform(0, 0.5))
+            r_otp = requests.post(otp_url, data=otp_params, headers=headers, timeout=15)
+            if r_otp.status_code != 200 or len(r_otp.text.strip()) < 5:
+                log(f"   ⏭️  {date_str} OTP 失敗")
+                continue
 
-        if "서비스가 원할하지 않습니다" in r_csv.text or len(r_csv.text.strip()) < 100:
-            raise RuntimeError("KRX returned error or empty response")
+            otp = r_otp.text.strip()
+            r_csv = requests.post(dn_url, data={'code': otp}, headers=headers, timeout=20)
+            r_csv.encoding = 'cp949'
 
-        raw_text = r_csv.text.strip()
-        lines = raw_text.split('\n')
-        log(f"📄 原始 CSV 行數: {len(lines)}")
+            raw_text = r_csv.text.strip()
+            if "서비스가 원할하지 않습니다" in raw_text or len(raw_text) < 100:
+                log(f"   ⏭️  {date_str} 無效或空資料，嘗試前一日...")
+                continue
 
-        # === 🔍 診斷輸出：顯示前 3 行（幫助你分析結構）===
-        for i, line in enumerate(lines[:3]):
-            clean_line = line.replace('\r', '').replace('"', '')
-            log(f"   📌 Line {i}: {clean_line[:120]}{'...' if len(clean_line) > 120 else ''}")
+            # 成功取得有效資料！
+            log(f"✅ 使用交易日: {date_str}")
+            df = pd.read_csv(io.StringIO(raw_text))
 
-        # 嘗試用 pandas 讀取
-        df = pd.read_csv(io.StringIO(raw_text))
-        log(f"📊 Pandas 解析後形狀: {df.shape}")
-        log(f"   欄位名稱: {list(df.columns)}")
-
-        sector_map = {}
-        code_col = None
-        sector_col = None
-
-        # 嘗試智能匹配欄位名（支援新舊格式）
-        for col in df.columns:
-            c = str(col).strip()
-            if re.search(r'단축코드|종목코드|ISU_SRT_CD|CODE', c, re.IGNORECASE):
-                code_col = col
-            elif re.search(r'업종명|SECT_TP_NM|IDX_IND_NM|산업|INDUSTRY', c, re.IGNORECASE):
-                sector_col = col
-
-        if not code_col or not sector_col:
-            log("⚠️ 自動識別失敗 → 改用固定位置解析（第0欄=代碼, 第1欄=產業）")
-            # === 💡 強制使用位置解析（最穩方案）===
+            sector_map = {}
+            # 💡 強制使用位置：第0欄=代碼，第1欄=產業（最穩方案）
             for i in range(len(df)):
                 try:
                     code_raw = str(df.iloc[i, 0]).strip().replace('"', '').replace("'", "")
@@ -92,38 +82,28 @@ def fetch_sector_mapping():
                             sector_map[code_raw] = sector_raw
                 except Exception:
                     continue
-        else:
-            log(f"✅ 成功識別欄位: 代碼={code_col}, 產業={sector_col}")
-            for _, row in df.iterrows():
-                code_raw = str(row[code_col]).strip()
-                if code_raw.isdigit() and len(code_raw) == 6:
-                    sector = str(row[sector_col]).strip()
-                    if sector and sector not in ['-', '']:
-                        sector_map[code_raw] = sector
 
-        log(f"✅ 最終載入 {len(sector_map)} 個產業對應")
-        
-        # === 🧪 顯示前 3 個成功映射（驗證正確性）===
-        sample_items = list(sector_map.items())[:3]
-        for code, sect in sample_items:
-            log(f"   🔍 映射範例: {code} → {sect}")
+            log(f"✅ 成功載入 {len(sector_map)} 個產業對應")
+            sample_items = list(sector_map.items())[:3]
+            for code, sect in sample_items:
+                log(f"   🔍 映射範例: {code} → {sect}")
+            return sector_map
 
-        return sector_map
+        except Exception as e:
+            log(f"   ⏭️  {date_str} 請求異常: {e}")
+            continue
 
-    except Exception as e:
-        log(f"❌ 產業分類抓取失敗: {e}")
-        return {}
+    log("❌ 所有日期嘗試失敗，無法取得產業分類")
+    return {}
 
 # ========== 3. 主清單獲取（FDR + KRX Sector 合併）==========
 def get_kr_stock_list():
     log("📡 正在透過 FinanceDataReader + KRX 產業表 獲取完整清單...")
     
     try:
-        # Step 1: 用 FDR 拿基本資料
         df_fdr = fdr.StockListing('KRX')
         log(f"📊 FDR 原始資料: {len(df_fdr)} 檔")
 
-        # Step 2: 從 KRX 拿產業映射
         sector_map = fetch_sector_mapping()
 
         conn = sqlite3.connect(DB_PATH)
@@ -140,7 +120,6 @@ def get_kr_stock_list():
             symbol = f"{code_clean}{suffix}"
             name = str(row['Name']).strip()
             
-            # 優先用 KRX 產業，其次用 FDR（若存在），否則 Unknown
             sector = sector_map.get(code_clean)
             if not sector and pd.notna(row.get('Sector')):
                 sector = str(row['Sector']).strip()
@@ -167,7 +146,7 @@ def get_kr_stock_list():
         log(f"❌ 清單整合失敗: {e}")
         return []
 
-# ========== 4. 批量下載股價（保持不變）==========
+# ========== 4. 批量下載股價 ==========
 def download_batch(batch_items, mode):
     symbols = [it[0] for it in batch_items]
     start_date = "2020-01-01" if mode == 'hot' else "2010-01-01"
