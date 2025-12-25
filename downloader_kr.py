@@ -36,7 +36,7 @@ def fetch_sector_mapping():
             'money': '1',
             'csvxls_isNo': 'false',
             'name': 'fileDown',
-            'url': 'dbms/MDC/STAT/standard/MDCSTAT01801'  # 產業分類
+            'url': 'dbms/MDC/STAT/standard/MDCSTAT01801'
         }
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -51,34 +51,63 @@ def fetch_sector_mapping():
         r_csv = requests.post(dn_url, data={'code': otp}, headers=headers, timeout=20)
         r_csv.encoding = 'cp949'
 
-        if "서비스가 원할하지 않습니다" in r_csv.text:
-            raise RuntimeError("KRX error page")
+        if "서비스가 원할하지 않습니다" in r_csv.text or len(r_csv.text.strip()) < 100:
+            raise RuntimeError("KRX returned error or empty response")
 
-        df = pd.read_csv(io.StringIO(r_csv.text))
+        raw_text = r_csv.text.strip()
+        lines = raw_text.split('\n')
+        log(f"📄 原始 CSV 行數: {len(lines)}")
+
+        # === 🔍 診斷輸出：顯示前 3 行（幫助你分析結構）===
+        for i, line in enumerate(lines[:3]):
+            clean_line = line.replace('\r', '').replace('"', '')
+            log(f"   📌 Line {i}: {clean_line[:120]}{'...' if len(clean_line) > 120 else ''}")
+
+        # 嘗試用 pandas 讀取
+        df = pd.read_csv(io.StringIO(raw_text))
+        log(f"📊 Pandas 解析後形狀: {df.shape}")
+        log(f"   欄位名稱: {list(df.columns)}")
+
         sector_map = {}
-
-        # 智能識別欄位
         code_col = None
         sector_col = None
+
+        # 嘗試智能匹配欄位名（支援新舊格式）
         for col in df.columns:
             c = str(col).strip()
-            if re.search(r'단축코드|종목코드', c):
+            if re.search(r'단축코드|종목코드|ISU_SRT_CD|CODE', c, re.IGNORECASE):
                 code_col = col
-            elif re.search(r'업종명|SECT_NM', c):
+            elif re.search(r'업종명|SECT_TP_NM|IDX_IND_NM|산업|INDUSTRY', c, re.IGNORECASE):
                 sector_col = col
 
         if not code_col or not sector_col:
-            log("⚠️ 無法識別 KRX 產業表欄位，跳過產業映射")
-            return {}
+            log("⚠️ 自動識別失敗 → 改用固定位置解析（第0欄=代碼, 第1欄=產業）")
+            # === 💡 強制使用位置解析（最穩方案）===
+            for i in range(len(df)):
+                try:
+                    code_raw = str(df.iloc[i, 0]).strip().replace('"', '').replace("'", "")
+                    sector_raw = str(df.iloc[i, 1]).strip().replace('"', '').replace("'", "")
+                    if code_raw.isdigit() and len(code_raw) == 6:
+                        if sector_raw and sector_raw not in ['-', '', 'N/A', 'NaN', 'null']:
+                            sector_map[code_raw] = sector_raw
+                except Exception:
+                    continue
+        else:
+            log(f"✅ 成功識別欄位: 代碼={code_col}, 產業={sector_col}")
+            for _, row in df.iterrows():
+                code_raw = str(row[code_col]).strip()
+                if code_raw.isdigit() and len(code_raw) == 6:
+                    sector = str(row[sector_col]).strip()
+                    if sector and sector not in ['-', '']:
+                        sector_map[code_raw] = sector
 
-        for _, row in df.iterrows():
-            code_raw = str(row[code_col]).strip()
-            if code_raw.isdigit() and len(code_raw) == 6:
-                sector = str(row[sector_col]).strip()
-                if sector and sector not in ['-', '']:
-                    sector_map[code_raw] = sector
+        log(f"✅ 最終載入 {len(sector_map)} 個產業對應")
+        
+        # === 🧪 顯示前 3 個成功映射（驗證正確性）===
+        sample_items = list(sector_map.items())[:3]
+        for code, sect in sample_items:
+            log(f"   🔍 映射範例: {code} → {sect}")
 
-        log(f"✅ 成功載入 {len(sector_map)} 個產業對應")
         return sector_map
 
     except Exception as e:
@@ -125,7 +154,7 @@ def get_kr_stock_list():
             
             items.append((symbol, name))
             if len(samples) < 5 and sector != "Other/Unknown":
-                samples.append(f"   ✅ {symbol} | {name[:10]} | {sector}")
+                samples.append(f"   ✅ {symbol} | {name[:12]} | {sector}")
 
         conn.commit()
         conn.close()
