@@ -182,6 +182,11 @@ def run_sync(mode='hot'):
     conn.commit()
     conn.close()
 
+    # 💡 修正回傳統計：查詢資料庫中實際擁有的不重複標的總數
+    conn = sqlite3.connect(DB_PATH)
+    final_db_count = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_info").fetchone()[0]
+    conn.close()
+
     has_changed = stats['success'] > 0
     if has_changed or IS_GITHUB_ACTIONS:
         log("🧹 優化資料庫 (VACUUM)...")
@@ -191,10 +196,11 @@ def run_sync(mode='hot'):
 
     duration = (time.time() - start_time) / 60
     log(f"📊 同步完成！費時: {duration:.1f} 分鐘")
-    log(f"✅ 成功: {stats['success']} | ⚡ 快取: {stats['cache']} | ❌ 錯誤/無資料: {stats['error'] + stats['empty']}")
+    log(f"✅ 資料庫總數: {final_db_count} | 本次更新: {stats['success']} | ❌ 錯誤/無資料: {stats['error'] + stats['empty']}")
 
     return {
-        "success": stats['success'] + stats['cache'],
+        "success": final_db_count,     # 回傳資料庫實有總數，防止 Coverage 爆表
+        "total": len(items),          # 本次目標清單總數
         "fail_list": fail_list,
         "has_changed": has_changed
     }
