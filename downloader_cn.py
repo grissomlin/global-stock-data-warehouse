@@ -21,8 +21,8 @@ DATA_EXPIRY_SECONDS = 86400  # 本機快取效期：24小時
 if not IS_GITHUB_ACTIONS and not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ✅ 效能設定：本機加速為 6 執行緒
-THREADS_CN = 4 if IS_GITHUB_ACTIONS else 6 
+# ✅ 效能設定：GitHub 模式降低併發數以降低 IP 被封鎖機率
+THREADS_CN = 3 if IS_GITHUB_ACTIONS else 6 
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
@@ -49,79 +49,92 @@ def init_db():
         conn.close()
 
 def get_cn_stock_list():
-    """從 Akshare 獲取清單並同步寫入 stock_info"""
+    """從 Akshare 獲取清單並同步寫入 stock_info (加入重試邏輯)"""
     import akshare as ak
     log(f"📡 獲取 A 股名單... (環境: {'GitHub' if IS_GITHUB_ACTIONS else 'Local'})")
-    try:
-        # Akshare 資料來源比較穩定且快
-        df_sh = ak.stock_sh_a_spot_em()
-        df_sz = ak.stock_sz_a_spot_em()
-        df = pd.concat([df_sh, df_sz], ignore_index=True)
-        
-        df['code'] = df['代码'].astype(str).str.zfill(6)
-        valid_prefixes = ('000','001','002','003','300','301','600','601','603','605','688')
-        df = df[df['code'].str.startswith(valid_prefixes)]
-        
-        name_col = '名称' if '名称' in df.columns else '名稱'
-        conn = sqlite3.connect(DB_PATH)
-        stock_list = []
-        
-        for _, row in df.iterrows():
-            symbol = f"{row['code']}.SS" if row['code'].startswith('6') else f"{row['code']}.SZ"
-            name = row[name_col]
-            conn.execute("INSERT OR REPLACE INTO stock_info (symbol, name, updated_at) VALUES (?, ?, ?)",
-                         (symbol, name, datetime.now().strftime("%Y-%m-%d")))
-            stock_list.append((symbol, name))
+    
+    # 💡 針對 GitHub 常出現的網路超時加入 3 次重試
+    for attempt in range(3):
+        try:
+            df_sh = ak.stock_sh_a_spot_em()
+            df_sz = ak.stock_sz_a_spot_em()
+            df = pd.concat([df_sh, df_sz], ignore_index=True)
             
-        conn.commit()
-        conn.close()
-        log(f"✅ 成功獲取 A 股清單: {len(stock_list)} 檔")
-        return stock_list
-    except Exception as e:
-        log(f"⚠️ 獲取名單失敗: {e}")
-        return []
+            df['code'] = df['代码'].astype(str).str.zfill(6)
+            valid_prefixes = ('000','001','002','003','300','301','600','601','603','605','688')
+            df = df[df['code'].str.startswith(valid_prefixes)]
+            
+            name_col = '名称' if '名称' in df.columns else '名稱'
+            conn = sqlite3.connect(DB_PATH)
+            stock_list = []
+            
+            for _, row in df.iterrows():
+                symbol = f"{row['code']}.SS" if row['code'].startswith('6') else f"{row['code']}.SZ"
+                name = row[name_col]
+                conn.execute("INSERT OR REPLACE INTO stock_info (symbol, name, updated_at) VALUES (?, ?, ?)",
+                             (symbol, name, datetime.now().strftime("%Y-%m-%d")))
+                stock_list.append((symbol, name))
+                
+            conn.commit()
+            conn.close()
+            log(f"✅ 成功獲取 A 股清單: {len(stock_list)} 檔")
+            return stock_list
+        except Exception as e:
+            if attempt < 2:
+                log(f"⚠️ 獲取名單失敗 (第 {attempt+1} 次): {e}，15秒後重試...")
+                time.sleep(15)
+            else:
+                log(f"❌ 獲取名單失敗，嘗試多次後放棄: {e}")
+    return []
 
-# ========== 3. 核心下載/快取分流邏輯 ==========
+# ========== 3. 核心下載/重試邏輯 ==========
 
 def download_one(args):
     symbol, name, mode = args
     csv_path = os.path.abspath(os.path.join(CACHE_DIR, f"{symbol}.csv"))
     start_date = "2020-01-01" if mode == 'hot' else "1990-01-01"
     
-    # --- ⚡ 閃電快取分流 ---
+    # ⚡ 閃電快取
     if not IS_GITHUB_ACTIONS and os.path.exists(csv_path):
         file_age = time.time() - os.path.getmtime(csv_path)
         if file_age < DATA_EXPIRY_SECONDS:
             return {"symbol": symbol, "status": "cache"}
 
-    try:
-        # 亞秒級等待，A股標的多，時間設短一點
-        time.sleep(random.uniform(0.2, 0.6))
-        
-        tk = yf.Ticker(symbol)
-        hist = tk.history(start=start_date, timeout=20, auto_adjust=False)
-        
-        if hist is None or hist.empty:
-            return {"symbol": symbol, "status": "empty"}
+    # 💡 增加重試與更長的隨機延遲
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 💡 大幅拉長 GitHub 環境的等待時間 (1.5 ~ 3.5 秒)
+            wait_time = random.uniform(1.5, 3.5) if IS_GITHUB_ACTIONS else random.uniform(0.1, 0.4)
+            time.sleep(wait_time)
             
-        hist.reset_index(inplace=True)
-        hist.columns = [c.lower() for c in hist.columns]
-        if 'date' in hist.columns:
-            hist['date'] = pd.to_datetime(hist['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-        
-        df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
-        df_final['symbol'] = symbol
-        
-        if not IS_GITHUB_ACTIONS:
-            df_final.to_csv(csv_path, index=False)
+            tk = yf.Ticker(symbol)
+            hist = tk.history(start=start_date, timeout=25, auto_adjust=False)
+            
+            if hist is None or hist.empty:
+                return {"symbol": symbol, "status": "empty"}
+                
+            hist.reset_index(inplace=True)
+            hist.columns = [c.lower() for c in hist.columns]
+            if 'date' in hist.columns:
+                hist['date'] = pd.to_datetime(hist['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+            
+            df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
+            df_final['symbol'] = symbol
+            
+            if not IS_GITHUB_ACTIONS:
+                df_final.to_csv(csv_path, index=False)
 
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method=insert_or_replace)
-        conn.close()
-        
-        return {"symbol": symbol, "status": "success"}
-    except Exception as e:
-        return {"symbol": symbol, "status": "error"}
+            conn = sqlite3.connect(DB_PATH, timeout=60)
+            df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method=insert_or_replace)
+            conn.close()
+            
+            return {"symbol": symbol, "status": "success"}
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(random.uniform(8, 15)) # 失敗後深呼吸
+                continue
+            return {"symbol": symbol, "status": "error"}
 
 # ========== 4. 主同步流程 ==========
 
@@ -168,8 +181,12 @@ def run_sync(mode='hot'):
     log(f"📊 同步完成！費時: {duration:.1f} 分鐘")
     log(f"✅ 新增: {stats['success']} | ⚡ 快取跳過: {stats['cache']} | ❌ 錯誤: {stats['error']}")
 
+    # 💡 修正回傳統計
     return {
-        "success": stats['success'] + stats['cache'],
+        "success": stats['success'],
+        "cache": stats['cache'],
+        "error": stats['error'],
+        "total": len(items),
         "fail_list": fail_list,
         "has_changed": has_changed
     }
