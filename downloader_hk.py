@@ -1,23 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-downloader_hk.py
-----------------
-港股資料下載器（最終穩定版）
-
-✔ HKEX 清單 → 僅保留 5 位純數字代碼
-✔ Yahoo Finance → 動態嘗試 5 位 / 4 位 .HK
-✔ 修復 HKEX Excel 表頭不固定問題
-✔ 與 main.py / 全球 pipeline 完全相容
-"""
-
-import os, io, re, time, random, sqlite3, requests, urllib3
+import os, io, re, time, random, sqlite3, requests
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ========== 1. 環境設定 ==========
 MARKET_CODE = "hk-share"
@@ -25,45 +12,29 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "hk_stock_warehouse.db")
 IS_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
 
-MAX_WORKERS = 3 if IS_GITHUB_ACTIONS else 6
-BASE_DELAY  = 0.5 if IS_GITHUB_ACTIONS else 0.2
-
+# ✅ 效能優化參數
+BATCH_SIZE = 40        
+MAX_WORKERS = 4 if IS_GITHUB_ACTIONS else 10 
+BATCH_DELAY = (4.0, 8.0) if IS_GITHUB_ACTIONS else (0.5, 1.0)
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
-
-
-# ========== 2. DB 初始化 ==========
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_prices (
-                date TEXT,
-                symbol TEXT,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume INTEGER,
-                PRIMARY KEY (date, symbol)
-            )
-        """)
+                date TEXT, symbol TEXT, open REAL, high REAL, 
+                low REAL, close REAL, volume INTEGER,
+                PRIMARY KEY (date, symbol))""")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_info (
-                symbol TEXT PRIMARY KEY,
-                name TEXT,
-                sector TEXT,
-                market TEXT,
-                updated_at TEXT
-            )
-        """)
+                symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, market TEXT, updated_at TEXT)""")
     finally:
         conn.close()
 
-
-# ========== 3. HKEX 股票清單解析（只存 5 位代碼） ==========
+# ========== 2. 獲取名單 ==========
 
 def normalize_code_5d(val) -> str:
     digits = re.sub(r"\D", "", str(val))
@@ -71,166 +42,122 @@ def normalize_code_5d(val) -> str:
         return digits.zfill(5)
     return ""
 
-
 def get_hk_stock_list():
-    url = (
-        "https://www.hkex.com.hk/-/media/HKEX-Market/Services/Trading/"
-        "Securities/Securities-Lists/"
-        "Securities-Using-Standard-Transfer-Form-(including-GEM)-"
-        "By-Stock-Code-Order/secstkorder.xls"
-    )
+    url = "https://www.hkex.com.hk/-/media/HKEX-Market/Services/Trading/Securities/Securities-Lists/Securities-Using-Standard-Transfer-Form-(including-GEM)-By-Stock-Code-Order/secstkorder.xls"
     log("📡 正在從港交所下載股票清單...")
-
     try:
         r = requests.get(url, timeout=30, verify=False)
-        r.raise_for_status()
         df_raw = pd.read_excel(io.BytesIO(r.content), header=None)
+        
+        # 尋找表頭
+        header_row = 0
+        for i in range(20):
+            row_vals = [str(x) for x in df_raw.iloc[i].values]
+            if any("Stock Code" in v for v in row_vals):
+                header_row = i
+                break
+        
+        df = df_raw.iloc[header_row + 1:].copy()
+        df.columns = [str(x).strip() for x in df_raw.iloc[header_row].values]
+        code_col = next(c for c in df.columns if "Stock Code" in c)
+        name_col = next(c for c in df.columns if "Short Name" in c)
+
+        conn = sqlite3.connect(DB_PATH)
+        stock_list = []
+        for _, row in df.iterrows():
+            code_5d = normalize_code_5d(row[code_col])
+            if code_5d:
+                name = str(row[name_col]).strip()
+                # 這裡 sector 先維持原本的，後續下載時會補齊
+                conn.execute("INSERT OR IGNORE INTO stock_info (symbol, name, sector, market, updated_at) VALUES (?, ?, ?, ?, ?)",
+                             (code_5d, name, "Unknown", "HKEX", datetime.now().strftime("%Y-%m-%d")))
+                stock_list.append(code_5d)
+        conn.commit()
+        conn.close()
+        return stock_list
     except Exception as e:
-        log(f"❌ 無法下載 HKEX 清單: {e}")
+        log(f"❌ 清單獲取失敗: {e}")
         return []
 
-    # 找表頭
-    header_row = None
-    for i in range(20):
-        row_vals = [
-            str(x).replace("\xa0", " ").strip()
-            for x in df_raw.iloc[i].values
-        ]
-        if any("Stock Code" in v for v in row_vals) and any("Short Name" in v for v in row_vals):
-            header_row = i
-            break
+# ========== 3. 批量下載與產業補完 ==========
 
-    if header_row is None:
-        log("❌ 無法辨識 HKEX Excel 表頭")
-        return []
+def download_batch_task(codes_batch, mode):
+    # 港股在 Yahoo 必須是 00700.HK 格式
+    yahoo_symbols = [f"{c}.HK" for c in codes_batch]
+    start_date = "2020-01-01" if mode == "hot" else "2010-01-01"
+    
+    try:
+        # 💡 使用批量下載並請求 info (用於補齊產業)
+        tickers = yf.Tickers(" ".join(yahoo_symbols))
+        success_count = 0
+        conn = sqlite3.connect(DB_PATH, timeout=60)
 
-    df = df_raw.iloc[header_row + 1:].copy()
-    df.columns = [
-        str(x).replace("\xa0", " ").strip()
-        for x in df_raw.iloc[header_row].values
-    ]
-
-    code_col = next(c for c in df.columns if "Stock Code" in c)
-    name_col = next(c for c in df.columns if "Short Name" in c)
-
-    conn = sqlite3.connect(DB_PATH)
-    stock_list = []
-
-    for _, row in df.iterrows():
-        code_5d = normalize_code_5d(row[code_col])
-        if not code_5d:
-            continue
-
-        name = str(row[name_col]).strip()
-
-        conn.execute("""
-            INSERT OR REPLACE INTO stock_info
-            (symbol, name, sector, market, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            code_5d,
-            name,
-            "Unknown",
-            "HKEX",
-            datetime.now().strftime("%Y-%m-%d")
-        ))
-
-        stock_list.append((code_5d, name))
-
-    conn.commit()
-    conn.close()
-
-    log(f"✅ HKEX 清單解析完成：{len(stock_list)} 檔普通股")
-    return stock_list
-
-
-# ========== 4. Yahoo Finance symbol 嘗試 ==========
-
-def possible_yahoo_symbols(code_5d: str):
-    syms = [f"{code_5d}.HK"]
-    if code_5d.startswith("0"):
-        syms.append(f"{code_5d.lstrip('0')}.HK")
-    return syms
-
-
-def download_one(stock, mode="hot"):
-    code_5d, _ = stock
-    start_date = "2020-01-01" if mode == "hot" else "2000-01-01"
-
-    for sym in possible_yahoo_symbols(code_5d):
-        try:
-            time.sleep(random.uniform(BASE_DELAY, BASE_DELAY + 0.3))
-            tk = yf.Ticker(sym)
-            hist = tk.history(start=start_date, auto_adjust=True, timeout=20)
-
-            if hist is None or hist.empty:
+        for code_5d in codes_batch:
+            sym = f"{code_5d}.HK"
+            try:
+                tk = tickers.tickers[sym]
+                # 1. 下載歷史數據
+                hist = tk.history(start=start_date, auto_adjust=True)
+                if not hist.empty:
+                    hist = hist.reset_index()
+                    hist.columns = [c.lower() for c in hist.columns]
+                    hist['date_str'] = pd.to_datetime(hist['date']).dt.strftime('%Y-%m-%d')
+                    
+                    for _, r in hist.iterrows():
+                        conn.execute("INSERT OR REPLACE INTO stock_prices VALUES (?,?,?,?,?,?,?)",
+                                     (r['date_str'], code_5d, r['open'], r['high'], r['low'], r['close'], r['volume']))
+                    
+                    # 2. 💡 補齊產業別 (Sector)
+                    # 只有當目前為 Unknown 時才去抓，節省效能
+                    cursor = conn.execute("SELECT sector FROM stock_info WHERE symbol = ?", (code_5d,))
+                    current_sector = cursor.fetchone()[0]
+                    if current_sector == "Unknown":
+                        sector = tk.info.get('sector', 'Unknown')
+                        if sector != 'Unknown':
+                            conn.execute("UPDATE stock_info SET sector = ? WHERE symbol = ?", (sector, code_5d))
+                    
+                    success_count += 1
+            except:
                 continue
+        
+        conn.commit()
+        conn.close()
+        return success_count
+    except:
+        return 0
 
-            hist = hist.reset_index()
-            hist.columns = [c.lower() for c in hist.columns]
-
-            if 'date' in hist.columns:
-                hist['date'] = (
-                    pd.to_datetime(hist['date'])
-                    .dt.tz_localize(None)
-                    .dt.strftime('%Y-%m-%d')
-                )
-
-            df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']]
-            df_final['symbol'] = sym
-
-            conn = sqlite3.connect(DB_PATH, timeout=30)
-            df_final.to_sql(
-                "stock_prices",
-                conn,
-                if_exists="append",
-                index=False,
-                method="multi",
-                chunksize=200
-            )
-            conn.close()
-            return True
-        except Exception:
-            continue
-
-    return False
-
-
-# ========== 5. 主流程（main.py 會呼叫） ==========
+# ========== 4. 主流程 ==========
 
 def run_sync(mode="hot"):
     start_time = time.time()
     init_db()
+    codes = get_hk_stock_list()
+    if not codes: return {"success": 0, "has_changed": False}
 
-    stocks = get_hk_stock_list()
-    if not stocks:
-        return {"success": 0, "has_changed": False}
+    batches = [codes[i:i + BATCH_SIZE] for i in range(0, len(codes), BATCH_SIZE)]
+    log(f"🚀 開始港股同步 | 目標: {len(codes)} 檔 | 總批次: {len(batches)}")
 
-    log(f"🚀 開始港股同步 | 目標: {len(stocks)} 檔")
-
-    success = 0
+    total_success = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(download_one, s, mode) for s in stocks]
-        for f in tqdm(as_completed(futures), total=len(futures), desc="HK同步"):
-            if f.result():
-                success += 1
+        future_to_batch = {executor.submit(download_batch_task, b, mode): b for b in batches}
+        pbar = tqdm(total=len(codes), desc="HK同步")
+        for f in as_completed(future_to_batch):
+            time.sleep(random.uniform(*BATCH_DELAY))
+            total_success += f.result()
+            pbar.update(BATCH_SIZE)
+        pbar.close()
 
+    log("🧹 執行資料庫優化...")
     conn = sqlite3.connect(DB_PATH)
-    unique_cnt = conn.execute(
-        "SELECT COUNT(DISTINCT symbol) FROM stock_prices"
-    ).fetchone()[0]
     conn.execute("VACUUM")
+    # 統計產業別覆蓋率
+    unknown_cnt = conn.execute("SELECT COUNT(*) FROM stock_info WHERE sector = 'Unknown'").fetchone()[0]
     conn.close()
 
     duration = (time.time() - start_time) / 60
-    log(f"📊 港股完成 | 成功 {success}/{len(stocks)} | DB 股票數 {unique_cnt} | {duration:.1f} 分")
-
-    return {
-        "success": success,
-        "total": len(stocks),
-        "has_changed": success > 0
-    }
-
+    log(f"📊 港股完成！費時: {duration:.1f} 分鐘 | 剩餘 Unknown: {unknown_cnt}")
+    
+    return {"success": total_success, "total": len(codes), "has_changed": total_success > 0}
 
 if __name__ == "__main__":
     run_sync(mode="hot")
