@@ -84,7 +84,7 @@ def upload_db_to_drive(service, file_path, retries=3):
 
 # ========== 數據統計核心 (保證撈取所有欄位) ==========
 
-def get_db_summary(db_path, market_id):
+def get_db_summary(db_path, market_id, fail_list=None):
     """精確從資料庫撈出：股票數、總筆數、名稱同步、最新日期"""
     try:
         conn = sqlite3.connect(db_path)
@@ -106,6 +106,7 @@ def get_db_summary(db_path, market_id):
             "end_date": df_stats['d2'][0],
             "total_rows": df_stats['t'][0],
             "names_synced": info_count,
+            "fail_list": fail_list if fail_list else [], # 💡 這裡把失敗名單塞進去
             "status": "✅" if coverage >= 90 else "⚠️"
         }
     except Exception as e:
@@ -133,9 +134,19 @@ def main():
             download_db_from_drive(service, db_file)
 
         target_module = module_map.get(m)
-        target_module.run_sync(mode='hot') 
+        
+        # 💡 修改點：假設 downloader 回傳執行結果 (包含 fail_list)
+        # 如果你的 downloader 目前只回傳 None，請確保 downloader 的 run_sync 有 return fail_list
+        execution_results = target_module.run_sync(mode='hot') 
+        
+        # 取得失敗清單 (支援舊版 downloader 若無回傳則設為空)
+        current_fails = []
+        if isinstance(execution_results, dict):
+            current_fails = execution_results.get('fail_list', [])
+        elif isinstance(execution_results, list):
+            current_fails = execution_results
 
-        summary = get_db_summary(db_file, m)
+        summary = get_db_summary(db_file, m, fail_list=current_fails)
         if summary:
             all_summaries.append(summary)
 
