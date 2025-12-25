@@ -2,6 +2,7 @@
 import os, io, time, random, sqlite3, requests, re
 import pandas as pd
 import yfinance as yf
+import FinanceDataReader as fdr  # ✅ 使用韓國數據最強工具
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -19,217 +20,107 @@ BATCH_DELAY = (4.0, 8.0) if IS_GITHUB_ACTIONS else (0.5, 1.2)
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
 
-# ========== 2. 初始化資料庫 ==========
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute('''CREATE TABLE IF NOT EXISTS stock_prices (
-                            date TEXT, symbol TEXT, open REAL, high REAL, 
-                            low REAL, close REAL, volume INTEGER,
-                            PRIMARY KEY (date, symbol))''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS stock_info (
-                            symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, market TEXT, updated_at TEXT)''')
-        cursor = conn.execute("PRAGMA table_info(stock_info)")
-        columns = [col[1] for col in cursor.fetchall()]
-        if 'market' not in columns:
-            conn.execute("ALTER TABLE stock_info ADD COLUMN market TEXT")
-            conn.commit()
-    finally:
-        conn.close()
+# ========== 2. 獲取名單 (使用 FDR 徹底修復產業別) ==========
 
-# ========== 3. 抓取韓國上市清單（含產業）==========
 def get_kr_stock_list():
-    log("📡 正在從 KRX 官方獲取上市股票清單 (MDCSTAT01901 + 산업정보)...")
-    
-    otp_url = "http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd"
-    today_str = datetime.today().strftime("%Y%m%d")
-    
-    # ✅ 關鍵：加入 sect_tp=ALL 強制輸出 업종명 欄位
-    otp_params = {
-        'locale': 'ko_KR',
-        'mktId': 'ALL',                 # KOSPI + KOSDAQ
-        'trdDd': today_str,
-        'share': '1',
-        'money': '1',
-        'csvxls_isNo': 'false',
-        'name': 'fileDown',
-        'url': 'dbms/MDC/STAT/standard/MDCSTAT01901',
-        'sect_tp': 'ALL',               # ← 讓 CSV 包含 '업종명'
-    }
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
-        'Referer': 'http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101'
-    }
+    log("📡 正在透過 FinanceDataReader 獲取韓股完整產業清單...")
     
     try:
-        time.sleep(2)  # 避免被限流
-        r_otp = requests.post(otp_url, data=otp_params, headers=headers, timeout=15)
-        r_otp.raise_for_status()
-        otp_code = r_otp.text.strip()
-        if len(otp_code) < 10:
-            raise ValueError(f"Invalid OTP: '{otp_code}'")
-        log(f"🔑 OTP generated successfully (length: {len(otp_code)})")
-
-        dn_url = "http://data.krx.co.kr/comm/fileDn/download_csv/download.cmd"
-        r_csv = requests.post(dn_url, data={'code': otp_code}, headers=headers, timeout=30)
-        r_csv.encoding = 'cp949'  # 韓國編碼
+        # 1. 一次抓取 KOSPI 和 KOSDAQ 的所有上市股票資訊
+        df_krx = fdr.StockListing('KRX') # 包含所有市場
         
-        if "서비스가 원할하지 않습니다" in r_csv.text or r_csv.status_code != 200:
-            raise RuntimeError("KRX returned error page (可能過載)")
-
-        df = pd.read_csv(io.StringIO(r_csv.text))
-        log(f"📥 原始 CSV 行數: {len(df)}")
-        if df.empty:
-            raise RuntimeError("Downloaded CSV is empty")
-
-        # ✅ 智能欄位識別（容錯多種命名）
-        col_map = {}
-        for col in df.columns:
-            c = str(col).strip()
-            if re.search(r'단축코드|종목코드|ISU_SRT_CD', c):
-                col_map['code'] = col
-            elif re.search(r'한글\s*종목명|종목명|ISU_NM', c):
-                col_map['name'] = col
-            elif re.search(r'시장구분|MKT_NM', c):
-                col_map['market'] = col
-            elif re.search(r'업종명|SECT_TP_NM|산업분류', c):
-                col_map['sector'] = col
-
-        # 至少要有 code 和 name 才能繼續
-        if not col_map.get('code') or not col_map.get('name'):
-            log("⚠️ 缺少必要欄位 'code' 或 'name'，顯示前3列診斷：")
-            print(df.head(3).to_string())
-            return []
-
         conn = sqlite3.connect(DB_PATH)
         items = []
         samples = []
 
-        for _, row in df.iterrows():
-            code_raw = str(row[col_map['code']]).strip()
-            if not code_raw.isdigit():
-                continue
-            code_clean = code_raw.zfill(6)
-            if len(code_clean) != 6:
-                continue
-
-            market_raw = str(row.get(col_map.get('market'), 'Unknown')).strip()
-            suffix = ".KS" if "KOSPI" in market_raw.upper() else ".KQ"
+        # FDR 返回的欄位通常包含: Code, Name, Sector, Industry, ListingDate...
+        for _, row in df_krx.iterrows():
+            code_clean = str(row['Code']).strip().zfill(6)
+            
+            # 判斷市場後綴
+            mkt = str(row['Market'])
+            suffix = ".KS" if mkt == "KOSPI" else ".KQ"
             symbol = f"{code_clean}{suffix}"
             
-            name = str(row[col_map['name']]).strip()
-            sector = str(row.get(col_map.get('sector'), 'Other')).strip()  # 若無產業，設為 Other
-
+            name = str(row['Name']).strip()
+            # 💡 FDR 的 Sector 欄位非常準確
+            sector = str(row['Sector']).strip() if pd.notna(row['Sector']) else "Other/Unknown"
+            
             conn.execute("""
                 INSERT OR REPLACE INTO stock_info (symbol, name, sector, market, updated_at) 
                 VALUES (?, ?, ?, ?, ?)
-            """, (symbol, name, sector, market_raw, datetime.now().strftime("%Y-%m-%d")))
+            """, (symbol, name, sector, mkt, datetime.now().strftime("%Y-%m-%d")))
             
             items.append((symbol, name))
-            if len(samples) < 3:
-                samples.append(f"   🔍 {symbol} | {name[:12]} | {sector}")
-
+            if len(samples) < 5 and sector != "Other/Unknown":
+                samples.append(f"   ✅ 成功對接: {symbol} | {name[:8]} | 產業: {sector}")
+            
         conn.commit()
         conn.close()
         
-        log(f"✅ 韓國清單導入成功: {len(items)} 檔")
+        log(f"✅ 韓股名單導入成功: {len(items)} 檔 (產業別已修復)")
         for s in samples: print(s)
         return items
 
     except Exception as e:
-        log(f"❌ 韓國清單抓取失敗: {e}")
+        log(f"❌ FDR 獲取失敗: {e}")
         return []
 
-# ========== 4. 批量下載股價 ==========
+# ========== 3. 批量下載與同步 (維持高效版) ==========
+
 def download_batch(batch_items, mode):
     symbols = [it[0] for it in batch_items]
     start_date = "2020-01-01" if mode == 'hot' else "2010-01-01"
     try:
-        data = yf.download(
-            tickers=symbols,
-            start=start_date,
-            group_by='ticker',
-            auto_adjust=True,
-            threads=False,
-            progress=False,
-            timeout=45
-        )
-        if data.empty:
-            return 0
-
+        data = yf.download(tickers=symbols, start=start_date, group_by='ticker', 
+                           auto_adjust=True, threads=False, progress=False, timeout=45)
+        if data.empty: return 0
         conn = sqlite3.connect(DB_PATH, timeout=60)
         success = 0
-        symbol_list = [symbols] if isinstance(symbols, str) else symbols
-
-        for symbol in symbol_list:
+        target_list = symbols if isinstance(symbols, list) else [symbols]
+        for symbol in target_list:
             try:
-                df_symbol = data[symbol] if len(symbol_list) > 1 else data
-                if df_symbol.empty:
-                    continue
-                df_symbol = df_symbol.reset_index()
-                df_symbol.columns = [c.lower() for c in df_symbol.columns]
-                date_col = 'date' if 'date' in df_symbol.columns else df_symbol.columns[0]
-                df_symbol['date_str'] = pd.to_datetime(df_symbol[date_col]).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-                
-                rows = []
-                for _, r in df_symbol.iterrows():
-                    if pd.notna(r['open']):
-                        vol = int(r['volume']) if pd.notna(r['volume']) else 0
-                        rows.append((r['date_str'], symbol, r['open'], r['high'], r['low'], r['close'], vol))
-                
-                conn.executemany(
-                    "INSERT OR REPLACE INTO stock_prices VALUES (?,?,?,?,?,?,?)",
-                    rows
-                )
+                df = data[symbol].copy() if len(target_list) > 1 else data.copy()
+                df.dropna(how='all', inplace=True)
+                if df.empty: continue
+                df.reset_index(inplace=True)
+                df.columns = [c.lower() for c in df.columns]
+                date_col = 'date' if 'date' in df.columns else df.columns[0]
+                df['date_str'] = pd.to_datetime(df[date_col]).dt.strftime('%Y-%m-%d')
+                for _, r in df.iterrows():
+                    conn.execute("INSERT OR REPLACE INTO stock_prices VALUES (?,?,?,?,?,?,?)", 
+                                 (r['date_str'], symbol, r['open'], r['high'], r['low'], r['close'], r['volume']))
                 success += 1
-            except Exception:
-                continue
-
-        conn.commit()
-        conn.close()
+            except: continue
+        conn.commit(); conn.close()
         return success
-    except Exception:
-        return 0
+    except: return 0
 
-# ========== 5. 主流程 ==========
 def run_sync(mode='hot'):
     start_time = time.time()
-    init_db()
-    
+    # 初始化資料庫
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS stock_prices (date TEXT, symbol TEXT, open REAL, high REAL, low REAL, close REAL, volume INTEGER, PRIMARY KEY (date, symbol))")
+    conn.execute("CREATE TABLE IF NOT EXISTS stock_info (symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, market TEXT, updated_at TEXT)")
+    conn.close()
+
     items = get_kr_stock_list()
-    if not items:
-        log("🛑 韓股清單為空，跳過同步")
-        return {"success": 0, "total": 0, "has_changed": False}
+    if not items: return {"success": 0, "has_changed": False}
 
     batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
-    log(f"🚀 開始韓股高速同步 | 目標: {len(items)} 檔 | 總批次: {len(batches)}")
+    log(f"🚀 開始韓股同步 | 總目標: {len(items)} 檔 | 總批次: {len(batches)}")
 
     total_success = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_batch = {executor.submit(download_batch, b, mode): b for b in batches}
-        pbar = tqdm(total=len(items), desc="KR同步")
-        for f in as_completed(future_to_batch):
+        futures = {executor.submit(download_batch, b, mode): b for b in batches}
+        for f in tqdm(as_completed(futures), total=len(batches), desc="KR同步"):
             time.sleep(random.uniform(*BATCH_DELAY))
             total_success += f.result()
-            pbar.update(BATCH_SIZE)
-        pbar.close()
 
-    log("🧹 執行資料庫優化...")
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("VACUUM")
-    final_count = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_info").fetchone()[0]
-    conn.close()
-
-    duration = (time.time() - start_time) / 60
-    log(f"📊 同步完成！費時: {duration:.1f} 分鐘")
-    log(f"✅ 資料庫總數: {final_count} | 本次新增: {total_success}")
-    
-    return {
-        "success": final_count,
-        "total": len(items),
-        "has_changed": total_success > 0
-    }
+    log("🧹 資料庫優化...")
+    conn = sqlite3.connect(DB_PATH); conn.execute("VACUUM"); conn.close()
+    log(f"📊 同步完成！有效標的: {total_success} | 費時: {(time.time() - start_time)/60:.1f} 分鐘")
+    return {"success": total_success, "total": len(items), "has_changed": total_success > 0}
 
 if __name__ == "__main__":
-    run_sync(mode='hot')
+    run_sync()
