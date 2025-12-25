@@ -10,7 +10,7 @@ on:
         type: choice
         options: [all, tw, us, cn, hk, jp, kr]
   schedule:
-    - cron: '30 10 * * 1-5'
+    - cron: '30 10 * * 1-5' # 台北時間 18:30 執行
 
 jobs:
   prepare-matrix:
@@ -29,7 +29,8 @@ jobs:
   execute-task:
     needs: prepare-matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # 💡 增加超時保護，防止 yfinance 卡死浪費分鐘數
+    timeout-minutes: 180 
     strategy:
       fail-fast: false
       matrix:
@@ -43,10 +44,10 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4 # 💡 升級到 v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5 # 💡 升級到 v5
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -54,26 +55,24 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install resend google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          # 💡 確保安裝所有必要的套件，避免 ModuleNotFoundError
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install resend google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dotenv
 
-      # 💡 修正：現在 main.py 會自己處理 .gz 的下載與解壓
-      # 我們只需要確保 main.py 正常執行即可
       - name: Run Market Update
         run: |
-          python main.py ${{ matrix.market }}
+          # 💡 使用 -u 參數強制讓 python 即時印出 log，方便在 GitHub Actions 監控進度
+          python -u main.py ${{ matrix.market }}
 
-      # 💡 修正：刪除 Notify Success 步驟
-      # 因為 main.py 內部的 StockNotifier 已經會寄發專業版報表了
-      
       - name: Notify System Failure
         if: failure()
         run: |
           python -c "
           import os, requests
-          market = '${{ matrix.market }}'
-          msg = f'❌ 系統層級崩潰！\n市場: {market.upper()}\n請檢查 GitHub Actions 執行環境日誌。'
           token = os.getenv('TELEGRAM_BOT_TOKEN')
           chat_id = os.getenv('TELEGRAM_CHAT_ID')
-          requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg})
+          market = '${{ matrix.market }}'.upper()
+          msg = f'❌ 【系統崩潰】市場: {market}\n原因：GitHub Actions 執行失敗，請檢查日誌。'
+          if token and chat_id:
+              requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg})
           "
