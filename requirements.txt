@@ -6,27 +6,25 @@ lxml
 html5lib
 requests
 cryptography
+python-dotenv       # 💡 必須補上：讀取 .env 環境變數
 
-# --- 2. 核心下載引擎 (Yahoo Finance & 進度條) ---
+# --- 2. 核心下載引擎 ---
 yfinance
 tqdm
 
-# --- 3. 全球六國清單獲取 (特定市場套件) ---
-# [中國 A 股]
-akshare
-# [韓國股市]
-pykrx
-# [日本股市]
-tokyo-stock-exchange
+# --- 3. 全球六國清單獲取 ---
+akshare             # 中國 A 股
+pykrx               # 韓國股市
+tokyo-stock-exchange # 日本股市
+FinanceDataReader   # 💡 建議補上：日韓股名單備援
 
-# --- 4. Google Drive 雲端同步 (API 核心) ---
+# --- 4. Google Drive 雲端同步 ---
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
 
-# --- 5. 數據庫與本地維護 (Python 內建 sqlite3，但部分環境需 pysqlite3) ---
-# 通常不需額外安裝，但若環境極簡可備用
-# pysqlite3
+# --- 5. 通知系統 ---
+resend              # 💡 必須補上：Email 通報引擎
 
-# --- 6. 通知系統 (選配，如需執行結束傳送 Email) ---
-# resend
+# --- 6. 數據加工 (Parquet 格式支援) ---
+pyarrow             # 💡 建議補上：Parquet 讀寫支援
