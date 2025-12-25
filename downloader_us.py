@@ -11,19 +11,16 @@ from tqdm import tqdm
 MARKET_CODE = "us-share"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "us_stock_warehouse.db")
-
-# 💡 自動判斷環境：GitHub Actions 執行時此變數為 true
 IS_GITHUB_ACTIONS = os.getenv('GITHUB_ACTIONS') == 'true'
 
-# ✅ 快取設定
 CACHE_DIR = os.path.join(BASE_DIR, "cache_us")
-DATA_EXPIRY_SECONDS = 86400  # 本機快取效期：24小時
+DATA_EXPIRY_SECONDS = 86400
 
 if not IS_GITHUB_ACTIONS and not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ✅ 效能設定：美股量大，本機建議設 6-8 執行緒加速
-MAX_WORKERS = 5 if IS_GITHUB_ACTIONS else 8 
+# ✅ 效能調優：GitHub 伺服器 IP 較敏感，降低併發數以求穩定
+MAX_WORKERS = 3 if IS_GITHUB_ACTIONS else 8 
 LIST_THRESHOLD = 3000
 
 def log(msg: str):
@@ -32,12 +29,10 @@ def log(msg: str):
 # ========== 2. 核心輔助函式 ==========
 
 def insert_or_replace(table, conn, keys, data_iter):
-    """防止重複寫入的核心 SQL 邏輯"""
     sql = f"INSERT OR REPLACE INTO {table.name} ({', '.join(keys)}) VALUES ({', '.join(['?']*len(keys))})"
     conn.executemany(sql, data_iter)
 
 def init_db():
-    """初始化資料庫結構"""
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute('''CREATE TABLE IF NOT EXISTS stock_prices (
@@ -51,7 +46,6 @@ def init_db():
         conn.close()
 
 def classify_security(name: str, is_etf: bool) -> str:
-    """過濾掉權證、優先股、ETF 等非普通股標的"""
     if is_etf: return "Exclude"
     n_upper = str(name).upper()
     exclude_keywords = ["WARRANT", "RIGHTS", "UNIT", "PREFERRED", "DEPOSITARY", "ADR", "FOREIGN", "DEBENTURE", "PWT"]
@@ -59,92 +53,89 @@ def classify_security(name: str, is_etf: bool) -> str:
     return "Common Stock"
 
 def get_us_stock_list():
-    """從 Nasdaq 獲取最新美股清單並同步名稱"""
     all_items = []
     log(f"📡 獲取美股清單... (環境: {'GitHub' if IS_GITHUB_ACTIONS else 'Local'})")
-    
     urls = [
         "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt",
         "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
     ]
-    
     conn = sqlite3.connect(DB_PATH)
     for url in urls:
         try:
             r = requests.get(url, timeout=15)
             df = pd.read_csv(StringIO(r.text), sep="|")
             df = df[df["Test Issue"] == "N"]
-            
             sym_col = "Symbol" if "nasdaqlisted" in url else "NASDAQ Symbol"
             name_col = "Security Name"
             etf_col = "ETF"
-            
             for _, row in df.iterrows():
                 name = str(row[name_col])
                 is_etf = str(row[etf_col]) == "Y"
-                
                 if classify_security(name, is_etf) == "Common Stock":
                     symbol = str(row[sym_col]).strip().replace('$', '-')
                     conn.execute("INSERT OR REPLACE INTO stock_info (symbol, name, updated_at) VALUES (?, ?, ?)",
                                  (symbol, name, datetime.now().strftime("%Y-%m-%d")))
                     all_items.append((symbol, name))
-            
             time.sleep(1) 
         except Exception as e:
             log(f"⚠️ 清單抓取失敗 ({url}): {e}")
-
     conn.commit()
     conn.close()
-    
     unique_items = list(set(all_items))
     if len(unique_items) >= LIST_THRESHOLD:
         log(f"✅ 成功同步美股清單: {len(unique_items)} 檔")
         return unique_items
     return [("AAPL", "APPLE INC"), ("TSLA", "TESLA INC")]
 
-# ========== 3. 核心下載/快取分流邏輯 ==========
+# ========== 3. 核心下載/重試邏輯 ==========
 
 def download_one(args):
     symbol, name, mode = args
     csv_path = os.path.abspath(os.path.join(CACHE_DIR, f"{symbol}.csv"))
     start_date = "2020-01-01" if mode == 'hot' else "1962-01-02"
     
-    # --- ⚡ 閃電快取分流 ---
+    # ⚡ 閃電快取
     if not IS_GITHUB_ACTIONS and os.path.exists(csv_path):
         file_age = time.time() - os.path.getmtime(csv_path)
         if file_age < DATA_EXPIRY_SECONDS:
             return {"symbol": symbol, "status": "cache"}
 
-    try:
-        # 美股建議 Jitter，避免被 Yahoo 封鎖
-        time.sleep(random.uniform(0.2, 0.7))
-        tk = yf.Ticker(symbol)
-        hist = tk.history(start=start_date, auto_adjust=True, timeout=30)
-        
-        if hist is None or hist.empty:
-            return {"symbol": symbol, "status": "empty"}
+    # 💡 增加重試機制與長等待
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 💡 GitHub 模式下大幅拉長等待 (1.2 ~ 3.0 秒)
+            wait_time = random.uniform(1.2, 3.0) if IS_GITHUB_ACTIONS else random.uniform(0.1, 0.4)
+            time.sleep(wait_time)
             
-        hist.reset_index(inplace=True)
-        hist.columns = [c.lower() for c in hist.columns]
-        if 'date' in hist.columns:
-            # 美股時間處理 (轉為純日期)
-            hist['date'] = pd.to_datetime(hist['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-        
-        df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
-        df_final['symbol'] = symbol
-        
-        # 1. 存入本機 CSV 快取
-        if not IS_GITHUB_ACTIONS:
-            df_final.to_csv(csv_path, index=False)
+            tk = yf.Ticker(symbol)
+            hist = tk.history(start=start_date, auto_adjust=True, timeout=25)
+            
+            if hist is None or hist.empty:
+                return {"symbol": symbol, "status": "empty"}
+                
+            hist.reset_index(inplace=True)
+            hist.columns = [c.lower() for c in hist.columns]
+            if 'date' in hist.columns:
+                hist['date'] = pd.to_datetime(hist['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+            
+            df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
+            df_final['symbol'] = symbol
+            
+            if not IS_GITHUB_ACTIONS:
+                df_final.to_csv(csv_path, index=False)
 
-        # 2. 存入 SQL (防重複)
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method=insert_or_replace)
-        conn.close()
-        
-        return {"symbol": symbol, "status": "success"}
-    except Exception:
-        return {"symbol": symbol, "status": "error"}
+            conn = sqlite3.connect(DB_PATH, timeout=60)
+            # 使用 method=insert_or_replace 確保主鍵衝突時更新
+            df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method=insert_or_replace)
+            conn.close()
+            
+            return {"symbol": symbol, "status": "success"}
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(random.uniform(5, 12)) # 失敗後深呼吸再試
+                continue
+            return {"symbol": symbol, "status": "error"}
 
 # ========== 4. 主流程 ==========
 
@@ -176,23 +167,24 @@ def run_sync(mode='hot'):
             pbar.update(1)
         pbar.close()
 
-    # 💡 判斷變動標記
+    # 💡 數據變動判斷
     has_changed = stats['success'] > 0
     
     if has_changed or IS_GITHUB_ACTIONS:
-        log("🧹 偵測到變動或雲端環境，優化資料庫 (VACUUM)...")
+        log("🧹 執行資料庫優化 (VACUUM)...")
         conn = sqlite3.connect(DB_PATH)
         conn.execute("VACUUM")
         conn.close()
-    else:
-        log("⏩ 美股數據無變動，跳過 VACUUM。")
 
     duration = (time.time() - start_time) / 60
     log(f"📊 同步完成！費時: {duration:.1f} 分鐘")
-    log(f"✅ 新增: {stats['success']} | ⚡ 快取跳過: {stats['cache']} | ❌ 錯誤: {stats['error']}")
-
+    
+    # 💡 修正回傳統計：明確區分成功與快取
     return {
-        "success": stats['success'] + stats['cache'],
+        "success": stats['success'],  # 本次真正下載成功的
+        "cache": stats['cache'],      # 本次命中的快取
+        "error": stats['error'],      # 真正失敗的
+        "total": len(items),          # 應下載總數
         "fail_list": fail_list,
         "has_changed": has_changed
     }
