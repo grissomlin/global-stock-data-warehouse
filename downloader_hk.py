@@ -16,21 +16,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "hk_stock_warehouse.db")
 IS_GITHUB_ACTIONS = os.getenv('GITHUB_ACTIONS') == 'true'
 
-# 💡 參考 Colab 的高效設定
-BATCH_SIZE = 100  # 批次下載數量
-MAX_WORKERS = 3 if IS_GITHUB_ACTIONS else 5
+# ✅ 下載設定：港股建議低並發以確保成功率
+MAX_WORKERS = 2 if IS_GITHUB_ACTIONS else 4 
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
 
-# ========== 2. 代碼正規化 (Colab V5.0 邏輯) ==========
-
-def normalize_code4_yf(s: str) -> str:
-    """Yahoo 下載使用 4 位數 (e.g. 0001.HK)"""
-    digits = re.sub(r"\D", "", str(s or ""))
-    return digits[-4:].zfill(4) if digits and digits.isdigit() else ""
-
-# ========== 3. 資料庫與清單獲取 ==========
+# ========== 2. 資料庫與清單獲取 ==========
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -42,7 +34,6 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS stock_info (
                             symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, market TEXT, updated_at TEXT)''')
         
-        # 自動升級
         cursor = conn.execute("PRAGMA table_info(stock_info)")
         columns = [column[1] for column in cursor.fetchall()]
         if 'market' not in columns:
@@ -52,40 +43,41 @@ def init_db():
         conn.close()
 
 def get_hk_stock_list():
-    """結合 Colab 魯棒性的清單抓取"""
+    """獲取港股清單並確保寫入 stock_info (修復解析問題)"""
     url = "https://www.hkex.com.hk/-/media/HKEX-Market/Services/Trading/Securities/Securities-Lists/Securities-Using-Standard-Transfer-Form-(including-GEM)-By-Stock-Code-Order/secstkorder.xls"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     
-    log(f"📡 正在從港交所獲取清單...")
+    log(f"📡 正在從港交所同步最新名單...")
     try:
         r = requests.get(url, headers=headers, timeout=20, verify=False)
         df_raw = pd.read_excel(io.BytesIO(r.content), header=None)
         
-        # 智慧找表頭
+        # 💡 使用寬鬆比對尋找表頭
         hdr_idx = None
-        for i in range(min(20, len(df_raw))):
-            row_str = " ".join([str(x) for x in df_raw.iloc[i].values])
-            if "Stock Code" in row_str:
+        for i in range(min(30, len(df_raw))):
+            row_vals = [str(x).replace('\xa0', ' ').strip() for x in df_raw.iloc[i].values]
+            if any("Stock Code" in val for val in row_vals):
                 hdr_idx = i
                 break
         
-        if hdr_idx is None: raise ValueError("找不到 Excel 表頭")
+        if hdr_idx is None: raise ValueError("找不到 Excel 標題列")
 
         df = df_raw.iloc[hdr_idx+1:].copy()
-        df.columns = df_raw.iloc[hdr_idx].values
+        df.columns = [str(x).replace('\xa0', ' ').strip() for x in df_raw.iloc[hdr_idx].values]
         
         conn = sqlite3.connect(DB_PATH)
         stock_list = []
         
-        # 排除衍生品關鍵字
-        bad_kw = r"CBBC|WARRANT|RIGHTS|ETF|ETN|REIT|BOND|TRUST|FUND|牛熊|權證|輪證"
+        # 抓取 code 與 name 的正確欄位名
+        code_col = [c for c in df.columns if "Stock Code" in c][0]
+        name_col = [c for c in df.columns if "Short Name" in c][0]
 
         for _, row in df.iterrows():
-            raw_code = str(row['Stock Code']).strip()
-            name = str(row.get('English Stock Short Name', 'Unknown')).strip()
+            raw_code = str(row[code_col]).strip()
+            name = str(row[name_col]).strip()
             
-            if raw_code.isdigit() and int(raw_code) < 10000 and not re.search(bad_kw, name, re.I):
-                symbol = f"{normalize_code4_yf(raw_code)}.HK"
+            if raw_code.isdigit() and int(raw_code) < 10000:
+                symbol = f"{raw_code.zfill(4)}.HK"
                 
                 conn.execute("""
                     INSERT OR REPLACE INTO stock_info (symbol, name, sector, market, updated_at) 
@@ -95,57 +87,52 @@ def get_hk_stock_list():
                 
         conn.commit()
         conn.close()
-        log(f"✅ 成功同步清單: {len(stock_list)} 檔")
+        log(f"✅ 港股清單同步成功: {len(stock_list)} 檔")
         return stock_list
     except Exception as e:
-        log(f"❌ 獲取失敗: {e}，改用保底名單")
+        log(f"⚠️ 名單抓取失敗: {e}，使用保底清單")
         return [("0700.HK", "TENCENT"), ("09988.HK", "BABA-SW"), ("00005.HK", "HSBC")]
 
-# ========== 4. 批次下載邏輯 (Colab 核心優勢) ==========
+# ========== 3. 單檔下載邏輯 (修復 yf.download 錯誤) ==========
 
-def download_batch_and_save(symbols_chunk, mode):
-    """
-    一次下載一批 symbols 並存入資料庫
-    """
+def download_one(symbol, name, mode):
     start_date = "2020-01-01" if mode == 'hot' else "2000-01-01"
-    success_count = 0
     
-    try:
-        # 💡 使用批次下載
-        data = yf.download(symbols_chunk, start=start_date, group_by='ticker', auto_adjust=True, progress=False, timeout=30)
-        
-        conn = sqlite3.connect(DB_PATH, timeout=60)
-        
-        for symbol in symbols_chunk:
-            try:
-                # 處理單檔與多檔回傳格式差異
-                df = data[symbol] if len(symbols_chunk) > 1 else data
-                
-                if df is None or df.empty: continue
-                
-                df = df.reset_index()
-                df.columns = [c.lower() for c in df.columns]
-                if 'date' in df.columns:
-                    df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-                
-                df_final = df[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
-                df_final['symbol'] = symbol
-                
-                # 寫入 SQLite
-                df_final.to_sql('stock_prices', conn, if_exists='append', index=False,
-                                method=lambda t, c, k, d: c.executemany(
-                                    f"INSERT OR REPLACE INTO {t.name} ({', '.join(k)}) VALUES ({', '.join(['?']*len(k))})", d))
-                success_count += 1
-            except:
+    # 重試機制
+    for attempt in range(3):
+        try:
+            # 💡 增加隨機延遲，防止 429 或 404 錯誤
+            time.sleep(random.uniform(2.5, 4.5) if IS_GITHUB_ACTIONS else 0.5)
+            
+            # 使用 yf.Ticker 比較穩定
+            tk = yf.Ticker(symbol)
+            hist = tk.history(start=start_date, auto_adjust=True, timeout=20)
+            
+            if hist is None or hist.empty:
                 continue
-                
-        conn.close()
-        return success_count
-    except Exception as e:
-        log(f"⚠️ 批次下載失敗: {e}")
-        return 0
+            
+            hist = hist.reset_index()
+            hist.columns = [c.lower() for c in hist.columns]
+            if isinstance(hist.columns, pd.MultiIndex):
+                hist.columns = hist.columns.get_level_values(0)
 
-# ========== 5. 主流程 (具備分批處理能力) ==========
+            hist['date'] = pd.to_datetime(hist['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+            df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
+            df_final['symbol'] = symbol
+            
+            # 寫入資料庫
+            conn = sqlite3.connect(DB_PATH, timeout=60)
+            df_final.to_sql('stock_prices', conn, if_exists='append', index=False,
+                            method=lambda t, c, k, d: c.executemany(
+                                f"INSERT OR REPLACE INTO {t.name} ({', '.join(k)}) VALUES ({', '.join(['?']*len(k))})", d))
+            conn.close()
+            return True
+        except Exception as e:
+            if attempt == 2: log(f"❌ {symbol} 下載失敗: {e}")
+            time.sleep(10) # 錯誤後冷靜 10 秒
+    return False
+
+# ========== 4. 主流程 ==========
 
 def run_sync(mode='hot'):
     start_time = time.time()
@@ -154,22 +141,18 @@ def run_sync(mode='hot'):
     items = get_hk_stock_list()
     if not items: return {"success": 0, "has_changed": False}
 
-    symbols = [it[0] for it in items]
-    log(f"🚀 開始批次同步港股 | 總數: {len(symbols)} | 批次大小: {BATCH_SIZE}")
+    log(f"🚀 開始同步港股 | 執行緒: {MAX_WORKERS}")
 
     total_success = 0
-    # 將 symbols 分成 chunk
-    chunks = [symbols[i:i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
-    
-    with tqdm(total=len(symbols), desc="HK同步中") as pbar:
-        for chunk in chunks:
-            # 隨機延遲避開 429
-            time.sleep(random.uniform(2, 5) if IS_GITHUB_ACTIONS else 0.5)
-            
-            # 執行批次下載
-            count = download_batch_and_save(chunk, mode)
-            total_success += count
-            pbar.update(len(chunk))
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(download_one, it[0], it[1], mode): it[0] for it in items}
+        pbar = tqdm(total=len(items), desc="HK同步中")
+        
+        for f in as_completed(futures):
+            if f.result():
+                total_success += 1
+            pbar.update(1)
+        pbar.close()
 
     log("🧹 執行 VACUUM...")
     conn = sqlite3.connect(DB_PATH)
@@ -177,11 +160,11 @@ def run_sync(mode='hot'):
     conn.close()
 
     duration = (time.time() - start_time) / 60
-    log(f"📊 完成！成功更新: {total_success} 檔 | 費時: {duration:.1f} 分鐘")
+    log(f"📊 同步完成！成功: {total_success} 檔 | 費時: {duration:.1f} 分鐘")
     
     return {
         "success": total_success,
-        "error": len(symbols) - total_success,
+        "error": len(items) - total_success,
         "has_changed": total_success > 0
     }
 
