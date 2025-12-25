@@ -19,7 +19,7 @@ BATCH_DELAY = (4.0, 8.0) if IS_GITHUB_ACTIONS else (0.5, 1.2)
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
 
-# ========== 2. 資料庫初始化 ==========
+# ========== 2. 初始化資料庫 ==========
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -37,23 +37,24 @@ def init_db():
     finally:
         conn.close()
 
-# ========== 3. 抓取韓國上市清單（關鍵修正版）==========
+# ========== 3. 抓取韓國上市清單（含產業）==========
 def get_kr_stock_list():
-    log("📡 正在從 KRX 官方獲取上市股票清單 (MDCSTAT01901)...")
+    log("📡 正在從 KRX 官方獲取上市股票清單 (MDCSTAT01901 + 산업정보)...")
     
-    # Step 1: Generate OTP
     otp_url = "http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd"
     today_str = datetime.today().strftime("%Y%m%d")
     
+    # ✅ 關鍵：加入 sect_tp=ALL 強制輸出 업종명 欄位
     otp_params = {
         'locale': 'ko_KR',
-        'mktId': 'ALL',                 # ALL = KOSPI + KOSDAQ
-        'trdDd': today_str,             # 觸發最新資料
+        'mktId': 'ALL',                 # KOSPI + KOSDAQ
+        'trdDd': today_str,
         'share': '1',
         'money': '1',
         'csvxls_isNo': 'false',
         'name': 'fileDown',
-        'url': 'dbms/MDC/STAT/standard/MDCSTAT01901'  # ✅ 正確模組！
+        'url': 'dbms/MDC/STAT/standard/MDCSTAT01901',
+        'sect_tp': 'ALL',               # ← 讓 CSV 包含 '업종명'
     }
     
     headers = {
@@ -62,57 +63,54 @@ def get_kr_stock_list():
     }
     
     try:
-        # 避免被限流（尤其 GitHub Actions）
-        time.sleep(2)
+        time.sleep(2)  # 避免被限流
         r_otp = requests.post(otp_url, data=otp_params, headers=headers, timeout=15)
         r_otp.raise_for_status()
         otp_code = r_otp.text.strip()
-        
         if len(otp_code) < 10:
             raise ValueError(f"Invalid OTP: '{otp_code}'")
-        
         log(f"🔑 OTP generated successfully (length: {len(otp_code)})")
 
-        # Step 2: Download CSV with OTP
         dn_url = "http://data.krx.co.kr/comm/fileDn/download_csv/download.cmd"
         r_csv = requests.post(dn_url, data={'code': otp_code}, headers=headers, timeout=30)
-        r_csv.encoding = 'cp949'  # 韓國標準編碼
+        r_csv.encoding = 'cp949'  # 韓國編碼
         
-        # 檢查是否回傳錯誤頁面
         if "서비스가 원할하지 않습니다" in r_csv.text or r_csv.status_code != 200:
-            raise RuntimeError("KRX returned error page (可能過載或維護中)")
+            raise RuntimeError("KRX returned error page (可能過載)")
 
         df = pd.read_csv(io.StringIO(r_csv.text))
         log(f"📥 原始 CSV 行數: {len(df)}")
-
         if df.empty:
             raise RuntimeError("Downloaded CSV is empty")
 
-        # Step 3: 智能欄位映射（容錯韓文/英文混用）
+        # ✅ 智能欄位識別（容錯多種命名）
         col_map = {}
         for col in df.columns:
             c = str(col).strip()
-            if re.search(r'종목코드|ISU_SRT_CD|ISU_CD', c): col_map['code'] = col
-            elif re.search(r'종목명|ISU_NM', c): col_map['name'] = col
-            elif re.search(r'시장구분|MKT_NM', c): col_map['market'] = col
-            elif re.search(r'업종명|SECT_TP_NM', c): col_map['sector'] = col
+            if re.search(r'단축코드|종목코드|ISU_SRT_CD', c):
+                col_map['code'] = col
+            elif re.search(r'한글\s*종목명|종목명|ISU_NM', c):
+                col_map['name'] = col
+            elif re.search(r'시장구분|MKT_NM', c):
+                col_map['market'] = col
+            elif re.search(r'업종명|SECT_TP_NM|산업분류', c):
+                col_map['sector'] = col
 
+        # 至少要有 code 和 name 才能繼續
         if not col_map.get('code') or not col_map.get('name'):
-            log("⚠️ 無法識別必要欄位，顯示前3列診斷：")
+            log("⚠️ 缺少必要欄位 'code' 或 'name'，顯示前3列診斷：")
             print(df.head(3).to_string())
             return []
 
-        # Step 4: 寫入資料庫
         conn = sqlite3.connect(DB_PATH)
         items = []
         samples = []
 
         for _, row in df.iterrows():
             code_raw = str(row[col_map['code']]).strip()
-            if not code_raw.replace('A', '').isdigit():  # 移除可能的 'A' 前綴
+            if not code_raw.isdigit():
                 continue
-
-            code_clean = re.sub(r'\D', '', code_raw).zfill(6)
+            code_clean = code_raw.zfill(6)
             if len(code_clean) != 6:
                 continue
 
@@ -121,7 +119,7 @@ def get_kr_stock_list():
             symbol = f"{code_clean}{suffix}"
             
             name = str(row[col_map['name']]).strip()
-            sector = str(row.get(col_map.get('sector'), 'Other')).strip()
+            sector = str(row.get(col_map.get('sector'), 'Other')).strip()  # 若無產業，設為 Other
 
             conn.execute("""
                 INSERT OR REPLACE INTO stock_info (symbol, name, sector, market, updated_at) 
@@ -177,7 +175,8 @@ def download_batch(batch_items, mode):
                 rows = []
                 for _, r in df_symbol.iterrows():
                     if pd.notna(r['open']):
-                        rows.append((r['date_str'], symbol, r['open'], r['high'], r['low'], r['close'], int(r['volume']) if pd.notna(r['volume']) else 0))
+                        vol = int(r['volume']) if pd.notna(r['volume']) else 0
+                        rows.append((r['date_str'], symbol, r['open'], r['high'], r['low'], r['close'], vol))
                 
                 conn.executemany(
                     "INSERT OR REPLACE INTO stock_prices VALUES (?,?,?,?,?,?,?)",
