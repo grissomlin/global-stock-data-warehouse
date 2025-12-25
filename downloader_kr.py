@@ -16,6 +16,7 @@ import re
 import pandas as pd
 import yfinance as yf
 import requests
+import FinanceDataReader as fdr  # ✅ 修正點：補上遺漏的 import
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -37,96 +38,90 @@ def log(msg: str):
 # ========== 2. 從 KRX Excel 抓取產業分類 ==========
 def fetch_krx_industry_from_excel():
     """
-    從 KRX 官方靜態連結下載 상장법인목록.xls 並解析 업종（產業）
-    返回 dict: { '005930': '전기전자', ... }
+    從 KIND 系統下載最新的產業對照表
     """
-    log("📡 正在從 KRX 下載 상장법인목록.xls (Excel 格式)...")
+    log("📡 正在從 KIND 系統下載產業清單 (Excel 格式)...")
     
+    # 使用 KIND 的下載接口
     url = "http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
 
     try:
-        time.sleep(1.5)  # 避免被限流
+        time.sleep(1.5)  
         r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
 
-        # 🔥 關鍵：用 BytesIO + read_excel 解析二進位 Excel
-        df = pd.read_excel(io.BytesIO(r.content), dtype=str)
-        log(f"📥 成功載入 Excel 表格，共 {len(df)} 筆公司")
+        # KIND 回傳的是一個偽裝成 XLS 的 HTML 表格，Pandas read_html 處理它最穩定
+        dfs = pd.read_html(io.BytesIO(r.content))
+        if not dfs:
+            log("❌ KIND 回傳內容中找不到表格")
+            return {}
+        
+        df = dfs[0]
+        log(f"📥 成功獲取 KIND 清單，共 {len(df)} 筆資料")
 
-        # 自動識別欄位（避免硬編索引）
-        code_col = None
-        sector_col = None
-        for col in df.columns:
-            col_str = str(col).strip()
-            if '종목코드' in col_str:
-                code_col = col
-            elif '업종' in col_str:
-                sector_col = col
+        # 欄位映射
+        sector_map = {}
+        # KIND 下載的欄位通常固定： 회사명, 종목코드, 업종, 주요제품...
+        # 我們主要需要 '종목코드' (代碼) 和 '업종' (產業)
+        
+        # 尋找代碼和產業的正確欄位名稱
+        code_col = next((c for c in df.columns if '종목코드' in str(c)), None)
+        sector_col = next((c for c in df.columns if '업종' in str(c)), None)
 
-        if not code_col or not sector_col:
-            log("❌ 無法識別 '종목코드' 或 '업종' 欄位，跳過產業解析")
+        if code_col is None or sector_col is None:
+            log(f"❌ 無法辨識欄位。現有欄位: {df.columns.tolist()}")
             return {}
 
-        sector_map = {}
         for _, row in df.iterrows():
-            raw_code = str(row[code_col]).strip()
+            code = str(row[code_col]).strip().zfill(6)
             sector = str(row[sector_col]).strip()
+            if code and sector:
+                sector_map[code] = sector
 
-            # 清理代碼：只保留 6 位數字
-            clean_code = re.sub(r'\D', '', raw_code)
-            if len(clean_code) == 6 and sector and sector not in ('', '-', 'N/A', 'nan'):
-                sector_map[clean_code] = sector
-
-        log(f"✅ 成功載入 {len(sector_map)} 個產業對應（來自 KRX Excel）")
-        sample_items = list(sector_map.items())[:3]
-        for code, ind in sample_items:
-            log(f"   🔍 {code} → {ind}")
-
+        log(f"✅ 成功載入 {len(sector_map)} 個產業對應")
         return sector_map
 
     except Exception as e:
-        log(f"❌ 下載或解析 KRX Excel 失敗: {e}")
-        import traceback
-        traceback.print_exc()
+        log(f"❌ KIND Excel 解析失敗: {e}")
         return {}
 
 
-# ========== 3. 主清單獲取（FDR + KRX Excel 產業）==========
+# ========== 3. 主清單獲取（FDR + KIND 產業）==========
 def get_kr_stock_list():
-    log("📡 正在透過 FinanceDataReader + KRX Excel 獲取完整清單...")
+    log("📡 正在整合 FinanceDataReader 清單與 KIND 產業資料...")
     
     try:
+        # 獲取 FDR 清單
         df_fdr = fdr.StockListing('KRX')
-        log(f"📊 FDR 原始資料: {len(df_fdr)} 檔")
+        log(f"📊 FDR 獲取到 {len(df_fdr)} 檔標的")
 
-        # 嘗試從 KRX Excel 取得產業
-        krx_sector_map = fetch_krx_industry_from_excel()
+        # 獲取產業映射
+        kind_sector_map = fetch_krx_industry_from_excel()
 
         conn = sqlite3.connect(DB_PATH)
         items = []
         valid_sector_count = 0
 
         for _, row in df_fdr.iterrows():
-            code_clean = str(row['Code']).strip()
-            if not code_clean.isdigit() or len(code_clean) != 6:
-                continue
-
+            code_clean = str(row['Code']).strip().zfill(6)
+            
+            # 判斷市場後綴
             market = str(row.get('Market', 'Unknown')).strip()
             suffix = ".KS" if market == "KOSPI" else ".KQ"
             symbol = f"{code_clean}{suffix}"
             name = str(row['Name']).strip()
 
-            # 優先使用 KRX Excel 的產業，其次嘗試 FDR 的 Sector，否則標記 Unknown
-            sector = krx_sector_map.get(code_clean)
+            # 優先權：KIND 產業別 > FDR Sector 欄位 > Unknown
+            sector = kind_sector_map.get(code_clean)
             if not sector:
-                sector = str(row.get('Sector', '')).strip() or "Other/Unknown"
-            if sector in ('', 'NaN', 'nan'):
+                sector = str(row.get('Sector', '')).strip()
+            
+            if not sector or sector.lower() in ('nan', 'none', ''):
                 sector = "Other/Unknown"
-
-            if sector != "Other/Unknown":
+            else:
                 valid_sector_count += 1
 
             conn.execute("""
@@ -140,9 +135,6 @@ def get_kr_stock_list():
         conn.close()
 
         log(f"✅ 韓股清單整合成功: {len(items)} 檔（含有效產業: {valid_sector_count}）")
-        if valid_sector_count == 0:
-            log("⚠️ 注意：所有股票產業均為 'Other/Unknown'，可能 KRX/FDR 資料異常")
-
         return items
 
     except Exception as e:
@@ -152,7 +144,7 @@ def get_kr_stock_list():
         return []
 
 
-# ========== 4. 批量下載股價 ==========
+# ========== 4. 批量下載股價 (維持原有效率邏輯) ==========
 def download_batch(batch_items, mode):
     symbols = [it[0] for it in batch_items]
     start_date = "2020-01-01" if mode == 'hot' else "2010-01-01"
@@ -200,7 +192,7 @@ def download_batch(batch_items, mode):
         return 0
 
 
-# ========== 5. 初始化 DB & 主流程 ==========
+# ========== 5. 初始化 & 主流程 ==========
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute('''CREATE TABLE IF NOT EXISTS stock_prices (
