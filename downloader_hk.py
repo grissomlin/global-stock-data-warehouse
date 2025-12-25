@@ -1,4 +1,15 @@
 # -*- coding: utf-8 -*-
+"""
+downloader_hk.py
+----------------
+港股資料下載器（最終穩定版）
+
+✔ HKEX 清單 → 僅保留 5 位純數字代碼
+✔ Yahoo Finance → 動態嘗試 5 位 / 4 位 .HK
+✔ 修復 HKEX Excel 表頭不固定問題
+✔ 與 main.py / 全球 pipeline 完全相容
+"""
+
 import os, io, re, time, random, sqlite3, requests, urllib3
 import pandas as pd
 import yfinance as yf
@@ -14,31 +25,45 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "hk_stock_warehouse.db")
 IS_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
 
-# ✅ 效能優化參數
-BATCH_SIZE = 40        
-MAX_WORKERS = 4 if IS_GITHUB_ACTIONS else 10 
-BATCH_DELAY = (4.0, 8.0) if IS_GITHUB_ACTIONS else (0.5, 1.2)
+MAX_WORKERS = 3 if IS_GITHUB_ACTIONS else 6
+BASE_DELAY  = 0.5 if IS_GITHUB_ACTIONS else 0.2
+
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
 
-# ========== 2. 資料庫初始化 ==========
+
+# ========== 2. DB 初始化 ==========
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_prices (
-                date TEXT, symbol TEXT, open REAL, high REAL, 
-                low REAL, close REAL, volume INTEGER,
-                PRIMARY KEY (date, symbol))""")
+                date TEXT,
+                symbol TEXT,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume INTEGER,
+                PRIMARY KEY (date, symbol)
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_info (
-                symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, market TEXT, updated_at TEXT)""")
+                symbol TEXT PRIMARY KEY,
+                name TEXT,
+                sector TEXT,
+                market TEXT,
+                updated_at TEXT
+            )
+        """)
     finally:
         conn.close()
 
-# ========== 3. HKEX 股票清單解析 (強化穩定性) ==========
+
+# ========== 3. HKEX 股票清單解析（只存 5 位代碼） ==========
 
 def normalize_code_5d(val) -> str:
     digits = re.sub(r"\D", "", str(val))
@@ -46,193 +71,166 @@ def normalize_code_5d(val) -> str:
         return digits.zfill(5)
     return ""
 
+
 def get_hk_stock_list():
-    url = "https://www.hkex.com.hk/-/media/HKEX-Market/Services/Trading/Securities/Securities-Lists/Securities-Using-Standard-Transfer-Form-(including-GEM)-By-Stock-Code-Order/secstkorder.xls"
-    
-    # 💡 模擬更真實的瀏覽器請求頭，防止被 HKEX 攔截
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.hkex.com.hk/'
-    }
-    
-    log("📡 正在從港交所獲取最新股票清單...")
-    
+    url = (
+        "https://www.hkex.com.hk/-/media/HKEX-Market/Services/Trading/"
+        "Securities/Securities-Lists/"
+        "Securities-Using-Standard-Transfer-Form-(including-GEM)-"
+        "By-Stock-Code-Order/secstkorder.xls"
+    )
+    log("📡 正在從港交所下載股票清單...")
+
     try:
-        r = requests.get(url, timeout=30, verify=False, headers=headers)
+        r = requests.get(url, timeout=30, verify=False)
         r.raise_for_status()
-        
-        # 使用 Excel 引擎讀取
         df_raw = pd.read_excel(io.BytesIO(r.content), header=None)
-        
-        # 尋找表頭
-        header_row = None
-        for i in range(min(20, len(df_raw))):
-            row_vals = [str(x).strip() for x in df_raw.iloc[i].values]
-            if any("Stock Code" in v for v in row_vals):
-                header_row = i
-                break
-
-        if header_row is None:
-            log("❌ 無法在 Excel 中定位表頭")
-            return []
-
-        df = df_raw.iloc[header_row + 1:].copy()
-        df.columns = [str(x).strip() for x in df_raw.iloc[header_row].values]
-        
-        code_col = next(c for c in df.columns if "Stock Code" in c)
-        name_col = next(c for c in df.columns if "Short Name" in c)
-
-        conn = sqlite3.connect(DB_PATH)
-        stock_list = []
-        for _, row in df.iterrows():
-            code_5d = normalize_code_5d(row[code_col])
-            if code_5d:
-                name = str(row[name_col]).strip()
-                # 初始標記為 Unknown，稍後執行智慧補丁
-                conn.execute("INSERT OR IGNORE INTO stock_info VALUES (?, ?, ?, ?, ?)",
-                             (code_5d, name, "Unknown", "HKEX", datetime.now().strftime("%Y-%m-%d")))
-                stock_list.append(code_5d)
-        
-        conn.commit()
-        conn.close()
-        log(f"✅ HKEX 清單解析成功：共 {len(stock_list)} 檔")
-        return stock_list
-        
     except Exception as e:
-        log(f"❌ 港股清單解析失敗: {e}")
+        log(f"❌ 無法下載 HKEX 清單: {e}")
         return []
 
-# ========== 4. 批量下載核心邏輯 (Yahoo 批次提速) ==========
+    # 找表頭
+    header_row = None
+    for i in range(20):
+        row_vals = [
+            str(x).replace("\xa0", " ").strip()
+            for x in df_raw.iloc[i].values
+        ]
+        if any("Stock Code" in v for v in row_vals) and any("Short Name" in v for v in row_vals):
+            header_row = i
+            break
 
-def download_batch_task(codes_batch, mode):
-    yahoo_map = {f"{c}.HK": c for c in codes_batch}
-    symbols = list(yahoo_map.keys())
-    start_date = "2020-01-01" if mode == "hot" else "2010-01-01"
-    
-    try:
-        data = yf.download(tickers=symbols, start=start_date, group_by='ticker', 
-                           auto_adjust=True, progress=False, timeout=45)
-        
-        if data.empty: return 0
-        
-        conn = sqlite3.connect(DB_PATH, timeout=60)
-        success_in_batch = 0
-        
-        # 判斷是單一 symbol 還是多個
-        current_symbols = symbols if len(symbols) > 1 else [symbols[0]]
-        for sym in current_symbols:
-            try:
-                df = data[sym].dropna(how='all')
-                if df.empty: continue
-                
-                code_5d = yahoo_map[sym]
-                df = df.reset_index()
-                df.columns = [c.lower() for c in df.columns]
-                date_col = 'date' if 'date' in df.columns else df.columns[0]
-                df['date_str'] = pd.to_datetime(df[date_col]).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-                
-                for _, row in df.iterrows():
-                    conn.execute("INSERT OR REPLACE INTO stock_prices VALUES (?,?,?,?,?,?,?)",
-                                 (row['date_str'], code_5d, row['open'], row['high'], row['low'], row['close'], row['volume']))
-                success_in_batch += 1
-            except: continue
-            
-        conn.commit()
-        conn.close()
-        return success_in_batch
-    except:
-        return 0
+    if header_row is None:
+        log("❌ 無法辨識 HKEX Excel 表頭")
+        return []
 
-# ========== 5. 智慧產業別引擎 (Sector Engine) ==========
+    df = df_raw.iloc[header_row + 1:].copy()
+    df.columns = [
+        str(x).replace("\xa0", " ").strip()
+        for x in df_raw.iloc[header_row].values
+    ]
 
-def apply_sector_engine():
-    """使用智慧關鍵字規則引擎對 2000 檔港股進行分類"""
-    log("🔧 啟動智慧產業引擎 (Sector Engine)...")
-    
-    rules = {
-        "Financial Services": ["銀行", "保險", "證券", "金融", "Bank", "Insurance", "Finance", "Investment"],
-        "Technology": ["科技", "軟件", "芯片", "半導體", "電訊", "Tech", "Software", "Electronics"],
-        "Healthcare": ["醫藥", "生物", "醫療", "健康", "Health", "Pharma", "Medical"],
-        "Real Estate": ["地產", "物業", "發展", "物管", "建築", "Property", "Estate", "Building"],
-        "Consumer Discretionary": ["汽車", "零售", "服飾", "教育", "娛樂", "旅遊", "Retail", "Auto", "Consumer"],
-        "Energy": ["石油", "煤炭", "能源", "採礦", "天然氣", "Oil", "Energy", "Mining"],
-        "Utilities": ["電力", "燃氣", "水務", "新能源", "Power", "Gas", "Water"],
-        "Industrials": ["工業", "機械", "運輸", "航運", "物流", "Logistic", "Industrial", "Shipping"]
-    }
-    
-    # 權值股精準映射補丁
-    precise_patch = {
-        "00700": "Communication Services", "09988": "Consumer Discretionary", 
-        "03690": "Consumer Discretionary", "01810": "Technology",
-        "00005": "Financial Services", "01299": "Financial Services",
-        "00939": "Financial Services", "01398": "Financial Services"
-    }
+    code_col = next(c for c in df.columns if "Stock Code" in c)
+    name_col = next(c for c in df.columns if "Short Name" in c)
 
     conn = sqlite3.connect(DB_PATH)
-    try:
-        # 1. 執行精準映射
-        for code, sector in precise_patch.items():
-            conn.execute("UPDATE stock_info SET sector = ? WHERE symbol = ?", (sector, code))
-        
-        # 2. 執行規則引擎 (針對剩餘 Unknown)
-        cursor = conn.execute("SELECT symbol, name FROM stock_info WHERE sector = 'Unknown'")
-        unknowns = cursor.fetchall()
-        for symbol, name in unknowns:
-            matched = "Hong Kong Equity" # 預設分類
-            for sector, keywords in rules.items():
-                if any(k in name for k in keywords):
-                    matched = sector
-                    break
-            conn.execute("UPDATE stock_info SET sector = ? WHERE symbol = ?", (matched, symbol))
-        
-        conn.commit()
-        
-        # 3. 抽樣顯示產業結果
-        sample = conn.execute("SELECT symbol, name, sector FROM stock_info LIMIT 5").fetchall()
-        for s in sample:
-            log(f"   💡 產業確認: {s[0]} | {s[1][:8]} | {s[2]}")
-            
-        log("✅ 港股產業分類已完成 (智慧規則匹配成功)")
-    finally:
-        conn.close()
+    stock_list = []
 
-# ========== 6. 主流程 ==========
+    for _, row in df.iterrows():
+        code_5d = normalize_code_5d(row[code_col])
+        if not code_5d:
+            continue
+
+        name = str(row[name_col]).strip()
+
+        conn.execute("""
+            INSERT OR REPLACE INTO stock_info
+            (symbol, name, sector, market, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            code_5d,
+            name,
+            "Unknown",
+            "HKEX",
+            datetime.now().strftime("%Y-%m-%d")
+        ))
+
+        stock_list.append((code_5d, name))
+
+    conn.commit()
+    conn.close()
+
+    log(f"✅ HKEX 清單解析完成：{len(stock_list)} 檔普通股")
+    return stock_list
+
+
+# ========== 4. Yahoo Finance symbol 嘗試 ==========
+
+def possible_yahoo_symbols(code_5d: str):
+    syms = [f"{code_5d}.HK"]
+    if code_5d.startswith("0"):
+        syms.append(f"{code_5d.lstrip('0')}.HK")
+    return syms
+
+
+def download_one(stock, mode="hot"):
+    code_5d, _ = stock
+    start_date = "2020-01-01" if mode == "hot" else "2000-01-01"
+
+    for sym in possible_yahoo_symbols(code_5d):
+        try:
+            time.sleep(random.uniform(BASE_DELAY, BASE_DELAY + 0.3))
+            tk = yf.Ticker(sym)
+            hist = tk.history(start=start_date, auto_adjust=True, timeout=20)
+
+            if hist is None or hist.empty:
+                continue
+
+            hist = hist.reset_index()
+            hist.columns = [c.lower() for c in hist.columns]
+
+            if 'date' in hist.columns:
+                hist['date'] = (
+                    pd.to_datetime(hist['date'])
+                    .dt.tz_localize(None)
+                    .dt.strftime('%Y-%m-%d')
+                )
+
+            df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']]
+            df_final['symbol'] = sym
+
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+            df_final.to_sql(
+                "stock_prices",
+                conn,
+                if_exists="append",
+                index=False,
+                method="multi",
+                chunksize=200
+            )
+            conn.close()
+            return True
+        except Exception:
+            continue
+
+    return False
+
+
+# ========== 5. 主流程（main.py 會呼叫） ==========
 
 def run_sync(mode="hot"):
     start_time = time.time()
     init_db()
-    
-    codes = get_hk_stock_list()
-    if not codes: 
-        log("⚠️ 未能獲取名單，結束同步。")
+
+    stocks = get_hk_stock_list()
+    if not stocks:
         return {"success": 0, "has_changed": False}
 
-    # 執行批量下載股價
-    batches = [codes[i:i + BATCH_SIZE] for i in range(0, len(codes), BATCH_SIZE)]
-    log(f"🚀 開始港股高速同步 | 目標: {len(codes)} 檔 | 總批次: {len(batches)}")
+    log(f"🚀 開始港股同步 | 目標: {len(stocks)} 檔")
 
-    total_success = 0
+    success = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_batch = {executor.submit(download_batch_task, b, mode): b for b in batches}
-        pbar = tqdm(total=len(codes), desc="HK同步")
-        for f in as_completed(future_to_batch):
-            time.sleep(random.uniform(*BATCH_DELAY))
-            total_success += f.result()
-            pbar.update(BATCH_SIZE)
-        pbar.close()
+        futures = [executor.submit(download_one, s, mode) for s in stocks]
+        for f in tqdm(as_completed(futures), total=len(futures), desc="HK同步"):
+            if f.result():
+                success += 1
 
-    # 🔥 關鍵：執行產業引擎補完 Unknown
-    apply_sector_engine()
+    conn = sqlite3.connect(DB_PATH)
+    unique_cnt = conn.execute(
+        "SELECT COUNT(DISTINCT symbol) FROM stock_prices"
+    ).fetchone()[0]
+    conn.execute("VACUUM")
+    conn.close()
 
-    log("🧹 執行資料庫優化...")
-    conn = sqlite3.connect(DB_PATH); conn.execute("VACUUM"); conn.close()
-    
     duration = (time.time() - start_time) / 60
-    log(f"📊 港股完成！費時: {duration:.1f} 分鐘")
-    
-    return {"success": total_success, "total": len(codes), "has_changed": total_success > 0}
+    log(f"📊 港股完成 | 成功 {success}/{len(stocks)} | DB 股票數 {unique_cnt} | {duration:.1f} 分")
+
+    return {
+        "success": success,
+        "total": len(stocks),
+        "has_changed": success > 0
+    }
+
 
 if __name__ == "__main__":
     run_sync(mode="hot")
