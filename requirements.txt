@@ -16,7 +16,7 @@ tqdm
 akshare             # 中國 A 股
 pykrx               # 韓國股市
 tokyo-stock-exchange # 日本股市
-FinanceDataReader   # 💡 建議補上：日韓股名單備援
+finance-datareader   # 💡 建議補上：日韓股名單備援
 
 # --- 4. Google Drive 雲端同步 ---
 google-api-python-client
@@ -27,4 +27,5 @@ google-auth-oauthlib
 resend              # 💡 必須補上：Email 通報引擎
 
 # --- 6. 數據加工 (Parquet 格式支援) ---
+
 pyarrow             # 💡 建議補上：Parquet 讀寫支援
