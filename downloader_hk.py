@@ -38,7 +38,7 @@ def init_db():
     finally:
         conn.close()
 
-# ========== 3. HKEX 股票清單解析 ==========
+# ========== 3. HKEX 股票清單解析 (強化穩定性) ==========
 
 def normalize_code_5d(val) -> str:
     digits = re.sub(r"\D", "", str(val))
@@ -48,25 +48,39 @@ def normalize_code_5d(val) -> str:
 
 def get_hk_stock_list():
     url = "https://www.hkex.com.hk/-/media/HKEX-Market/Services/Trading/Securities/Securities-Lists/Securities-Using-Standard-Transfer-Form-(including-GEM)-By-Stock-Code-Order/secstkorder.xls"
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    
+    # 💡 模擬更真實的瀏覽器請求頭，防止被 HKEX 攔截
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.hkex.com.hk/'
+    }
+    
     log("📡 正在從港交所獲取最新股票清單...")
     
     try:
         r = requests.get(url, timeout=30, verify=False, headers=headers)
+        r.raise_for_status()
+        
+        # 使用 Excel 引擎讀取
         df_raw = pd.read_excel(io.BytesIO(r.content), header=None)
         
         # 尋找表頭
         header_row = None
-        for i in range(20):
+        for i in range(min(20, len(df_raw))):
             row_vals = [str(x).strip() for x in df_raw.iloc[i].values]
             if any("Stock Code" in v for v in row_vals):
                 header_row = i
                 break
 
-        if header_row is None: return []
+        if header_row is None:
+            log("❌ 無法在 Excel 中定位表頭")
+            return []
 
         df = df_raw.iloc[header_row + 1:].copy()
         df.columns = [str(x).strip() for x in df_raw.iloc[header_row].values]
+        
         code_col = next(c for c in df.columns if "Stock Code" in c)
         name_col = next(c for c in df.columns if "Short Name" in c)
 
@@ -76,19 +90,21 @@ def get_hk_stock_list():
             code_5d = normalize_code_5d(row[code_col])
             if code_5d:
                 name = str(row[name_col]).strip()
-                # 初始標記為 Unknown，稍後執行補丁
+                # 初始標記為 Unknown，稍後執行智慧補丁
                 conn.execute("INSERT OR IGNORE INTO stock_info VALUES (?, ?, ?, ?, ?)",
                              (code_5d, name, "Unknown", "HKEX", datetime.now().strftime("%Y-%m-%d")))
                 stock_list.append(code_5d)
+        
         conn.commit()
         conn.close()
-        log(f"✅ HKEX 清單解析完成：{len(stock_list)} 檔")
+        log(f"✅ HKEX 清單解析成功：共 {len(stock_list)} 檔")
         return stock_list
+        
     except Exception as e:
         log(f"❌ 港股清單解析失敗: {e}")
         return []
 
-# ========== 4. 批量下載核心邏輯 ==========
+# ========== 4. 批量下載核心邏輯 (Yahoo 批次提速) ==========
 
 def download_batch_task(codes_batch, mode):
     yahoo_map = {f"{c}.HK": c for c in codes_batch}
@@ -104,6 +120,7 @@ def download_batch_task(codes_batch, mode):
         conn = sqlite3.connect(DB_PATH, timeout=60)
         success_in_batch = 0
         
+        # 判斷是單一 symbol 還是多個
         current_symbols = symbols if len(symbols) > 1 else [symbols[0]]
         for sym in current_symbols:
             try:
@@ -122,7 +139,8 @@ def download_batch_task(codes_batch, mode):
                 success_in_batch += 1
             except: continue
             
-        conn.commit(); conn.close()
+        conn.commit()
+        conn.close()
         return success_in_batch
     except:
         return 0
@@ -134,21 +152,22 @@ def apply_sector_engine():
     log("🔧 啟動智慧產業引擎 (Sector Engine)...")
     
     rules = {
-        "Financial Services": ["銀行", "保險", "證券", "金融", "Bank", "Insurance", "Finance"],
-        "Technology": ["科技", "軟件", "芯片", "半導體", "電訊", "Tech", "Software"],
-        "Healthcare": ["醫藥", "生物", "醫療", "健康", "Health", "Pharma"],
-        "Real Estate": ["地產", "物業", "發展", "物管", "Property", "Estate"],
-        "Consumer Discretionary": ["汽車", "零售", "服飾", "教育", "娛樂", "Retail", "Auto"],
-        "Energy": ["石油", "煤炭", "能源", "採礦", "Oil", "Energy"],
-        "Utilities": ["電力", "燃氣", "水務", "Power", "Gas", "Water"],
-        "Industrials": ["工業", "機械", "運輸", "航運", "Logistic", "Industrial"]
+        "Financial Services": ["銀行", "保險", "證券", "金融", "Bank", "Insurance", "Finance", "Investment"],
+        "Technology": ["科技", "軟件", "芯片", "半導體", "電訊", "Tech", "Software", "Electronics"],
+        "Healthcare": ["醫藥", "生物", "醫療", "健康", "Health", "Pharma", "Medical"],
+        "Real Estate": ["地產", "物業", "發展", "物管", "建築", "Property", "Estate", "Building"],
+        "Consumer Discretionary": ["汽車", "零售", "服飾", "教育", "娛樂", "旅遊", "Retail", "Auto", "Consumer"],
+        "Energy": ["石油", "煤炭", "能源", "採礦", "天然氣", "Oil", "Energy", "Mining"],
+        "Utilities": ["電力", "燃氣", "水務", "新能源", "Power", "Gas", "Water"],
+        "Industrials": ["工業", "機械", "運輸", "航運", "物流", "Logistic", "Industrial", "Shipping"]
     }
     
-    # 權值股精準映射
+    # 權值股精準映射補丁
     precise_patch = {
         "00700": "Communication Services", "09988": "Consumer Discretionary", 
         "03690": "Consumer Discretionary", "01810": "Technology",
-        "00005": "Financial Services", "01299": "Financial Services"
+        "00005": "Financial Services", "01299": "Financial Services",
+        "00939": "Financial Services", "01398": "Financial Services"
     }
 
     conn = sqlite3.connect(DB_PATH)
@@ -157,7 +176,7 @@ def apply_sector_engine():
         for code, sector in precise_patch.items():
             conn.execute("UPDATE stock_info SET sector = ? WHERE symbol = ?", (sector, code))
         
-        # 2. 執行規則引擎
+        # 2. 執行規則引擎 (針對剩餘 Unknown)
         cursor = conn.execute("SELECT symbol, name FROM stock_info WHERE sector = 'Unknown'")
         unknowns = cursor.fetchall()
         for symbol, name in unknowns:
@@ -169,7 +188,13 @@ def apply_sector_engine():
             conn.execute("UPDATE stock_info SET sector = ? WHERE symbol = ?", (matched, symbol))
         
         conn.commit()
-        log("✅ 港股產業分類已完成 (包含智慧規則匹配)")
+        
+        # 3. 抽樣顯示產業結果
+        sample = conn.execute("SELECT symbol, name, sector FROM stock_info LIMIT 5").fetchall()
+        for s in sample:
+            log(f"   💡 產業確認: {s[0]} | {s[1][:8]} | {s[2]}")
+            
+        log("✅ 港股產業分類已完成 (智慧規則匹配成功)")
     finally:
         conn.close()
 
@@ -180,7 +205,9 @@ def run_sync(mode="hot"):
     init_db()
     
     codes = get_hk_stock_list()
-    if not codes: return {"success": 0, "has_changed": False}
+    if not codes: 
+        log("⚠️ 未能獲取名單，結束同步。")
+        return {"success": 0, "has_changed": False}
 
     # 執行批量下載股價
     batches = [codes[i:i + BATCH_SIZE] for i in range(0, len(codes), BATCH_SIZE)]
