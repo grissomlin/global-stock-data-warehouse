@@ -6,17 +6,16 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# ========== 1. 環境判斷與參數設定 ==========
+# ========== 1. 環境與參數設定 ==========
 MARKET_CODE = "us-share"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "us_stock_warehouse.db")
 IS_GITHUB_ACTIONS = os.getenv('GITHUB_ACTIONS') == 'true'
 
-# ✅ 速度優化設定
-BATCH_SIZE = 50        # 每批次處理 50 檔股票 (平衡速度與被封風險)
+# ✅ 下載效率核心參數
+BATCH_SIZE = 40        # 每次請求 40 檔股票，平衡速度與 API 限制
 MAX_WORKERS = 4 if IS_GITHUB_ACTIONS else 10 
-# 批次間的等待時間
-BATCH_DELAY = (3.0, 7.0) if IS_GITHUB_ACTIONS else (0.5, 1.0)
+BATCH_DELAY = (4.0, 8.0) if IS_GITHUB_ACTIONS else (0.5, 1.0)
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
@@ -33,6 +32,7 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS stock_info (
                             symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, market TEXT, updated_at TEXT)''')
         
+        # 自動檢查並升級 market 欄位
         cursor = conn.execute("PRAGMA table_info(stock_info)")
         columns = [column[1] for column in cursor.fetchall()]
         if 'market' not in columns:
@@ -41,105 +41,110 @@ def init_db():
     finally:
         conn.close()
 
-# ========== 3. 獲取帶有產業別的美股名單 (名單優化) ==========
+# ========== 3. 獲取美股官方清單 (含產業與市場) ==========
 
-def get_us_stock_list_with_sectors():
-    """獲取美股名單並直接映射產業別"""
-    log("📡 正在獲取美股官方清單與產業對照表...")
+def get_us_stock_list_official():
+    """從 Nasdaq 官方 API 獲取完整清單，包含 Sector 資訊"""
+    log("📡 正在向 Nasdaq 官方 API 請求全體美股清單...")
     
-    # 來源：高品質的開源美股字典庫
-    ref_url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all/all_tickers.csv"
-    
+    # Nasdaq 官方 Screener API
+    url = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=15000&download=true"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://www.nasdaq.com/market-activity/stocks/screener'
+    }
+
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        r = requests.get(ref_url, headers=headers, timeout=20)
-        df_ref = pd.read_csv(io.StringIO(r.text))
+        r = requests.get(url, headers=headers, timeout=30)
+        data_json = r.json()
+        rows = data_json['data']['rows']
         
-        # 準備寫入 stock_info
         conn = sqlite3.connect(DB_PATH)
-        items = []
+        stock_list = []
         
-        # 過濾常見非正股關鍵字
-        exclude_kw = r"Warrant|Right|Preferred|Wrt|Unit"
-        df_clean = df_ref[~df_ref['Name'].str.contains(exclude_kw, na=False, case=False)]
-        
-        for _, row in df_clean.iterrows():
-            symbol = str(row['Ticker']).strip().upper()
-            name = str(row['Name']).strip()
-            sector = str(row.get('Sector', 'Unknown'))
-            market = str(row.get('Exchange', 'Unknown'))
+        # 過濾排除字眼 (ETF, 權證等)
+        exclude_pattern = re.compile(r"Warrant|Right|Preferred|Unit|ETF", re.I)
+
+        for row in rows:
+            symbol = str(row.get('symbol', '')).strip().upper()
+            # 排除非標準代碼 (如帶有斜線或尖號的優先股)
+            if not symbol or not symbol.isalpha(): continue
             
-            if sector == 'nan': sector = 'Unknown'
+            name = str(row.get('name', 'Unknown')).strip()
+            if exclude_pattern.search(name): continue
             
+            sector = str(row.get('sector', 'Unknown')).strip()
+            market = str(row.get('exchange', 'Unknown')).strip()
+            
+            # 存入資訊表
             conn.execute("""
                 INSERT OR REPLACE INTO stock_info (symbol, name, sector, market, updated_at) 
                 VALUES (?, ?, ?, ?, ?)
             """, (symbol, name, sector, market, datetime.now().strftime("%Y-%m-%d")))
-            items.append((symbol, name))
+            stock_list.append((symbol, name))
             
         conn.commit()
         conn.close()
-        log(f"✅ 美股清單同步成功: {len(items)} 檔 (已帶入產業資訊)")
-        return items
+        log(f"✅ 美股清單導入成功: {len(stock_list)} 檔 (包含產業類別)")
+        return stock_list
+        
     except Exception as e:
-        log(f"⚠️ 產業名單獲取失敗: {e}，使用備援機制")
-        return [("AAPL", "Apple"), ("TSLA", "Tesla")]
+        log(f"❌ 官方 API 獲取失敗: {e}。請檢查網路連線或稍後再試。")
+        return []
 
-# ========== 4. 批量下載下載邏輯 (速度提升 20 倍的關鍵) ==========
+# ========== 4. 批量下載邏輯 (效能優化核心) ==========
 
-def download_batch(symbols_batch, mode):
-    """批量下載 50 檔股票數據"""
+def download_batch_task(batch_items, mode):
+    """執行批次下載與存檔"""
+    symbols = [it[0] for it in batch_items]
     start_date = "2020-01-01" if mode == 'hot' else "2010-01-01"
     
     try:
-        # 💡 使用 yf.download 進行批量請求
+        # 使用 yf.download 批量請求以減少連線開銷
         data = yf.download(
-            tickers=symbols_batch,
+            tickers=symbols,
             start=start_date,
             group_by='ticker',
             auto_adjust=True,
-            threads=False, # 內部不開執行緒，由我們外部控制
+            threads=False, # 外部已有線程池
             progress=False,
-            timeout=30
+            timeout=40
         )
         
         if data.empty: return 0
         
         conn = sqlite3.connect(DB_PATH, timeout=60)
-        success_in_batch = 0
+        success_count = 0
         
-        # 處理下載回來的數據
-        for symbol in symbols_batch:
+        for symbol in symbols:
             try:
-                # 取得該檔股票的 DF
-                if len(symbols_batch) > 1:
-                    df = data[symbol].copy()
-                else:
-                    df = data.copy()
-                
+                # 處理單檔與多檔下載的 DataFrame 結構差異
+                df = data[symbol].copy() if len(symbols) > 1 else data.copy()
                 df.dropna(how='all', inplace=True)
                 if df.empty: continue
                 
                 df.reset_index(inplace=True)
                 df.columns = [c.lower() for c in df.columns]
                 
-                # 標準化日期
-                df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-                df['symbol'] = symbol
+                # 取得日期欄位並格式化
+                date_col = 'date' if 'date' in df.columns else df.columns[0]
+                df['date_str'] = pd.to_datetime(df[date_col]).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
                 
-                # 寫入資料庫
-                final_df = df[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
-                final_df.to_sql('stock_prices', conn, if_exists='append', index=False,
-                                method=lambda t, c, k, d: c.executemany(
-                                    f"INSERT OR REPLACE INTO {t.name} ({', '.join(k)}) VALUES ({', '.join(['?']*len(k))})", d))
-                success_in_batch += 1
+                # 批次寫入價格數據
+                for _, row in df.iterrows():
+                    conn.execute("""
+                        INSERT OR REPLACE INTO stock_prices (date, symbol, open, high, low, close, volume)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (row['date_str'], symbol, row['open'], row['high'], row['low'], row['close'], row['volume']))
+                success_count += 1
             except:
                 continue
-                
+        
+        conn.commit()
         conn.close()
-        return success_in_batch
-    except Exception as e:
-        log(f"⚠️ 批次下載異常: {e}")
+        return success_count
+    except:
         return 0
 
 # ========== 5. 主流程 ==========
@@ -148,22 +153,22 @@ def run_sync(mode='hot'):
     start_time = time.time()
     init_db()
     
-    items = get_us_stock_list_with_sectors()
-    symbols = [it[0] for it in items]
-    
-    # 將清單分成 BATCH_SIZE 一組
-    batches = [symbols[i:i + BATCH_SIZE] for i in range(0, len(symbols), BATCH_SIZE)]
-    log(f"🚀 開始美股批量同步 ({mode.upper()}) | 總共 {len(batches)} 個批次")
+    # 1. 獲取名單與產業別
+    items = get_us_stock_list_official()
+    if not items:
+        return {"success": 0, "has_changed": False}
+
+    # 2. 切分批次
+    batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
+    log(f"🚀 開始美股批量同步 | 總目標: {len(items)} 檔 | 總批次: {len(batches)}")
 
     total_success = 0
-    
-    # 併發執行批次
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_batch = {executor.submit(download_batch, b, mode): b for b in batches}
+        future_to_batch = {executor.submit(download_batch_task, b, mode): b for b in batches}
         
-        pbar = tqdm(total=len(symbols), desc="US同步中")
+        pbar = tqdm(total=len(items), desc="US數據同步")
         for f in as_completed(future_to_batch):
-            # 💡 每個批次完成後增加隨機等待，防止 IP 被封
+            # 批次間隔，防止頻率過高被封鎖
             time.sleep(random.uniform(*BATCH_DELAY))
             
             res = f.result()
@@ -171,20 +176,23 @@ def run_sync(mode='hot'):
             pbar.update(BATCH_SIZE)
         pbar.close()
 
-    # 優化
-    log("🧹 執行資料庫優化...")
+    # 3. 維護與統計
+    log("🧹 執行資料庫優化 (VACUUM)...")
     conn = sqlite3.connect(DB_PATH)
     conn.execute("VACUUM")
+    # 統計有效股票總數
+    db_count = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_info").fetchone()[0]
     conn.close()
 
     duration = (time.time() - start_time) / 60
-    log(f"📊 同步完成！成功標的: {total_success} | 費時: {duration:.1f} 分鐘")
+    log(f"📊 同步完成！有效標的總數: {db_count} | 本次更新: {total_success} | 費時: {duration:.1f} 分鐘")
     
     return {
         "success": total_success,
-        "total": len(symbols),
+        "total": len(items),
         "has_changed": total_success > 0
     }
 
 if __name__ == "__main__":
+    import re
     run_sync(mode='hot')
