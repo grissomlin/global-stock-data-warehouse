@@ -21,8 +21,8 @@ DATA_EXPIRY_SECONDS = 86400  # 本機快取效期：24小時
 if not IS_GITHUB_ACTIONS and not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ✅ 效能設定：本機加速為 6 執行緒
-MAX_WORKERS = 4 if IS_GITHUB_ACTIONS else 6 
+# ✅ 效能調優：GitHub 模式降低併發以求穩定
+MAX_WORKERS = 3 if IS_GITHUB_ACTIONS else 6 
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
@@ -64,7 +64,6 @@ def get_jp_stock_list():
     """獲取日股清單並同步更新名稱"""
     log(f"📡 獲取日股名單... (環境: {'GitHub' if IS_GITHUB_ACTIONS else 'Local'})")
     try:
-        # 讀取 TSE 套件內建清單
         df = pd.read_csv(tse.csv_file_path)
         
         code_col = next((c for c in ['コード', 'Code', 'code', 'Local Code'] if c in df.columns), None)
@@ -76,7 +75,6 @@ def get_jp_stock_list():
         
         for _, row in df.iterrows():
             raw_code = str(row[code_col]).strip()
-            # 格式：1234 -> 1234.T
             if len(raw_code) >= 4 and raw_code[:4].isdigit():
                 symbol = f"{raw_code[:4]}.T"
                 name = str(row[name_col]) if name_col else "Unknown"
@@ -94,50 +92,54 @@ def get_jp_stock_list():
         log(f"❌ 日股清單獲取失敗: {e}")
         return [("7203.T", "TOYOTA MOTOR")]
 
-# ========== 3. 核心下載/快取分流邏輯 ==========
+# ========== 3. 核心下載/重試邏輯 ==========
 
 def download_one(args):
     symbol, name, mode = args
     csv_path = os.path.abspath(os.path.join(CACHE_DIR, f"{symbol}.csv"))
     start_date = "2020-01-01" if mode == 'hot' else "1999-01-01"
     
-    # --- ⚡ 閃電快取分流 ---
+    # ⚡ 閃電快取
     if not IS_GITHUB_ACTIONS and os.path.exists(csv_path):
         file_age = time.time() - os.path.getmtime(csv_path)
         if file_age < DATA_EXPIRY_SECONDS:
             return {"symbol": symbol, "status": "cache"}
 
-    try:
-        # 亞秒級隨機等待
-        time.sleep(random.uniform(0.2, 0.6))
-        
-        tk = yf.Ticker(symbol)
-        hist = tk.history(start=start_date, timeout=25, auto_adjust=False)
-        
-        if hist is None or hist.empty:
-            return {"symbol": symbol, "status": "empty"}
+    # 💡 增加重試機制與長延遲 (針對 GitHub Actions 優化)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 💡 增加等待時間避開 Rate Limit (1.2 ~ 2.5秒)
+            wait_time = random.uniform(1.2, 2.5) if IS_GITHUB_ACTIONS else random.uniform(0.1, 0.4)
+            time.sleep(wait_time)
             
-        hist.reset_index(inplace=True)
-        hist.columns = [c.lower() for c in hist.columns]
-        if 'date' in hist.columns:
-            # 移除時區並標準化格式
-            hist['date'] = pd.to_datetime(hist['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-        
-        df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
-        df_final['symbol'] = symbol
-        
-        # 1. 存入本機 CSV 快取
-        if not IS_GITHUB_ACTIONS:
-            df_final.to_csv(csv_path, index=False)
+            tk = yf.Ticker(symbol)
+            hist = tk.history(start=start_date, timeout=25, auto_adjust=False)
+            
+            if hist is None or hist.empty:
+                return {"symbol": symbol, "status": "empty"}
+                
+            hist.reset_index(inplace=True)
+            hist.columns = [c.lower() for c in hist.columns]
+            if 'date' in hist.columns:
+                hist['date'] = pd.to_datetime(hist['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+            
+            df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
+            df_final['symbol'] = symbol
+            
+            if not IS_GITHUB_ACTIONS:
+                df_final.to_csv(csv_path, index=False)
 
-        # 2. 存入 SQL (使用防重複邏輯)
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method=insert_or_replace)
-        conn.close()
-        
-        return {"symbol": symbol, "status": "success"}
-    except Exception:
-        return {"symbol": symbol, "status": "error"}
+            conn = sqlite3.connect(DB_PATH, timeout=60)
+            df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method=insert_or_replace)
+            conn.close()
+            
+            return {"symbol": symbol, "status": "success"}
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(random.uniform(5, 10)) # 失敗後等待較長時間
+                continue
+            return {"symbol": symbol, "status": "error"}
 
 # ========== 4. 主流程 ==========
 
@@ -147,7 +149,7 @@ def run_sync(mode='hot'):
     
     items = get_jp_stock_list()
     if not items:
-        log("❌ 無法取得名單，終止任務。")
+        log("❌ 無法取得日股名單，終止任務。")
         return {"fail_list": [], "success": 0, "has_changed": False}
 
     log(f"🚀 開始執行日股 ({mode.upper()}) | 目標: {len(items)} 檔")
@@ -169,11 +171,11 @@ def run_sync(mode='hot'):
             pbar.update(1)
         pbar.close()
 
-    # 💡 判斷變動標記
+    # 💡 數據變動判斷
     has_changed = stats['success'] > 0
     
     if has_changed or IS_GITHUB_ACTIONS:
-        log("🧹 偵測到變動或雲端環境，優化資料庫 (VACUUM)...")
+        log("🧹 執行資料庫優化 (VACUUM)...")
         conn = sqlite3.connect(DB_PATH)
         conn.execute("VACUUM")
         conn.close()
@@ -182,10 +184,13 @@ def run_sync(mode='hot'):
 
     duration = (time.time() - start_time) / 60
     log(f"📊 同步完成！費時: {duration:.1f} 分鐘")
-    log(f"✅ 新增: {stats['success']} | ⚡ 快取跳過: {stats['cache']} | ❌ 錯誤: {stats['error']}")
-
+    
+    # 💡 修正回傳統計：明確統計成功與錯誤，確保 main.py 報表準確
     return {
-        "success": stats['success'] + stats['cache'],
+        "success": stats['success'],   # 本次真正下載成功的
+        "cache": stats['cache'],       # 本次命中的快取
+        "error": stats['error'],       # 真正失敗的
+        "total": len(items),           # 應下載總數
         "fail_list": fail_list,
         "has_changed": has_changed
     }
