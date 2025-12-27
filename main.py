@@ -5,10 +5,9 @@ from datetime import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-from dotenv import load_dotenv  # 💡 新增：載入環境變數工具
+from dotenv import load_dotenv
 
 # 💡 核心修正：在本機跑時，必須手動載入 .env 檔案
-# 這行會把 .env 裡的內容塞進 os.environ
 load_dotenv() 
 
 # 💡 全域逾時設定
@@ -20,14 +19,13 @@ SERVICE_ACCOUNT_FILE = 'citric-biplane-319514-75fead53b0f5.json'
 try:
     from notifier import StockNotifier
     notifier = StockNotifier()
-    # 💡 檢查是否有正確初始化
     if not os.getenv("TELEGRAM_BOT_TOKEN"):
         print("⚠️ 警告：環境變數 TELEGRAM_BOT_TOKEN 為空，通知功能將受限。")
 except Exception as e:
     print(f"❌ Notifier 初始化失敗: {e}")
     notifier = None
 
-# 匯入下載模組
+# 匯入各國下載模組
 import downloader_tw, downloader_us, downloader_cn, downloader_hk, downloader_jp, downloader_kr
 
 # 📊 應收標的門檻
@@ -35,7 +33,7 @@ EXPECTED_MIN_STOCKS = {
     'tw': 900, 'us': 5684, 'cn': 5496, 'hk': 2689, 'jp': 4315, 'kr': 2000
 }
 
-# [get_drive_service, download_db_from_drive, upload_db_to_drive 保持不變]
+# [Google Drive 相關函式保持不變]
 def get_drive_service():
     env_json = os.environ.get('GDRIVE_SERVICE_ACCOUNT')
     try:
@@ -93,6 +91,38 @@ def upload_db_to_drive(service, file_path, retries=3):
             time.sleep(5)
     return False
 
+# 💡 新增：檢查資料庫最新日期的功能
+def check_needs_update(db_path, market_id):
+    """檢查資料庫最新交易日，判斷是否需要更新"""
+    if not os.path.exists(db_path):
+        print(f"🆕 {market_id.upper()} 資料庫檔案不存在，準備全新同步。")
+        return True
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        # 抓取原始價格表中的最新日期
+        res = conn.execute("SELECT MAX(date) FROM stock_prices").fetchone()
+        conn.close()
+        
+        db_latest_date = res[0] if res and res[0] else None
+        if not db_latest_date:
+            print(f"⚠️ {market_id.upper()} 資料庫內無價格數據，需要更新。")
+            return True
+            
+        # 取得今天日期
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        print(f"📅 [{market_id.upper()}] 資料庫最新紀錄: {db_latest_date} | 執行當前日期: {today_str}")
+        
+        # 如果最新日期已經等於或大於今天，就跳過 (例如週六跑發現週五已更新過)
+        if db_latest_date >= today_str:
+            print(f"✅ {market_id.upper()} 數據已是最新，略過下載流程。")
+            return False
+            
+        return True
+    except Exception as e:
+        print(f"⚠️ 檢查日期時出錯: {e}，預設執行更新。")
+        return True
+
 def get_db_summary(db_path, market_id, fail_list=None):
     if not os.path.exists(db_path):
         return None
@@ -140,34 +170,38 @@ def main():
         db_file = f"{m}_stock_warehouse.db"
         print(f"\n--- 🌍 市場啟動: {m.upper()} ---")
 
+        # 1. 下載雲端備份
         if service and not os.path.exists(db_file):
             download_db_from_drive(service, db_file)
 
-        target_module = module_map.get(m)
-        execution_results = target_module.run_sync(mode='hot') 
+        # 💡 核心修正：判斷是否需要執行 run_sync
+        needs_update = check_needs_update(db_file, m)
         
-        current_fails = []
-        has_changed = False
-        if isinstance(execution_results, dict):
-            current_fails = execution_results.get('fail_list', [])
-            has_changed = execution_results.get('has_changed', False)
+        execution_results = {"has_changed": False, "fail_list": []}
+        
+        if needs_update:
+            target_module = module_map.get(m)
+            execution_results = target_module.run_sync(mode='hot') 
+        
+        # 2. 獲取摘要（不論有無更新都讀取目前資料庫狀態）
+        current_fails = execution_results.get('fail_list', []) if isinstance(execution_results, dict) else []
+        has_changed = execution_results.get('has_changed', False) if isinstance(execution_results, dict) else False
         
         summary = get_db_summary(db_file, m, fail_list=current_fails)
         if summary:
             all_summaries.append(summary)
-            print(f"📊 摘要已生成: {m.upper()} (覆蓋率: {summary['coverage']})")
+            print(f"📊 摘要已生成: {m.upper()} (最新日期: {summary['end_date']} | 覆蓋率: {summary['coverage']})")
 
-        if service:
-            if has_changed:
-                print(f"🔄 偵測到數據變動，正在優化並同步至雲端...")
-                conn = sqlite3.connect(db_file)
-                conn.execute("VACUUM")
-                conn.close()
-                upload_db_to_drive(service, db_file)
-            else:
-                print(f"⏭️ {m.upper()} 數據無變動 (全快取)，跳過雲端上傳以節省時間。")
+        # 3. 只有真的有變動才上傳雲端
+        if service and has_changed:
+            print(f"🔄 偵測到數據變動，正在優化並同步至雲端...")
+            conn = sqlite3.connect(db_file)
+            conn.execute("VACUUM")
+            conn.close()
+            upload_db_to_drive(service, db_file)
+        else:
+            print(f"⏭️ {m.upper()} 無變動或略過更新，跳過雲端上傳。")
 
-    # 💡 核心修正：加入通報發送的 Debug Log
     print(f"\n🏁 任務全部結束。收集到摘要: {len(all_summaries)} 份")
     
     if notifier is not None:
@@ -181,7 +215,7 @@ def main():
         else:
             print("⚠️ 摘要清單為空，跳過發送。")
     else:
-        print("❌ Notifier 物件為空，跳過通報階段。請檢查環境變數載入情形。")
+        print("❌ Notifier 物件為空，跳過通報階段。")
 
 if __name__ == "__main__":
     main()
