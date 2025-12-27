@@ -40,7 +40,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
-      GH_PAT: ${{ secrets.GH_PAT }} # 💡 用於觸發 Alpha Lab 的鑰匙
+      GH_PAT: ${{ secrets.GH_PAT }} # 💡 跨 Repo 觸發需要的 Token
 
     steps:
       - name: Checkout Code
@@ -60,17 +60,21 @@ jobs:
 
       - name: Run Market Update
         run: |
+          # 使用 -u 參數強制讓 python 即時印出 log
           python -u main.py ${{ matrix.market }}
 
-      # 🚀 新增連動步驟：只有台灣成功時，才發送訊號給下一個 Repo
+      # 🚀 連動步驟：只要該市場更新成功，就發送訊號給 Alpha Lab
       - name: 📢 Trigger Alpha Data Lab Sync
-        if: success() && matrix.market == 'tw'
+        if: success()
         run: |
-          echo "🚀 台灣數據更新成功，正在遠端觸發 Alpha-Data-Cleaning-Lab..."
+          # 轉換市場簡稱為資料庫格式 (例如 tw -> tw_stock_warehouse)
+          DB_NAME="${{ matrix.market }}_stock_warehouse"
+          echo "🚀 市場 ${{ matrix.market }} 更新成功，正在遠端觸發 Alpha-Data-Cleaning-Lab 精煉 $DB_NAME..."
+          
           curl -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
           -H "Accept: application/vnd.github.v3+json" \
           -H "Authorization: bearer $GH_PAT" \
-          -d '{"event_type": "warehouse_sync_complete"}'
+          -d "{\"event_type\": \"warehouse_sync_complete\", \"client_payload\": {\"market_db\": \"$DB_NAME\"}}"
 
       - name: Notify System Failure
         if: failure()
