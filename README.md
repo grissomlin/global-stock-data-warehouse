@@ -62,6 +62,7 @@
 ---
 
 <img width="679" height="745" alt="image" src="https://github.com/user-attachments/assets/62e191d8-e10c-45a5-b0cd-f42b365d76df" />
+<img width="544" height="974" alt="image" src="https://github.com/user-attachments/assets/d02646d7-ef6a-4a50-b774-67747ccb20bf" />
 
 
 ## 📄 免責聲明 (Disclaimer)
