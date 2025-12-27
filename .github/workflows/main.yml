@@ -10,8 +10,7 @@ on:
         type: choice
         options: [all, tw, us, cn, hk, jp, kr]
   schedule:
-    # 💡 修改為台北時間 14:00 執行 (14:00 CST = 06:00 UTC)
-    - cron: '0 6 * * 1-5' 
+    - cron: '0 6 * * 1-5' # 💡 台北時間 14:00 執行 (14:00 CST = 06:00 UTC)
 
 jobs:
   prepare-matrix:
@@ -41,8 +40,7 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
-      # 💡 跨 Repo 觸發需要的 Token (需在 Secrets 設定 GH_PAT)
-      GH_PAT: ${{ secrets.GH_PAT }}
+      GH_PAT: ${{ secrets.GH_PAT }} # 💡 用於觸發 Alpha Lab 的鑰匙
 
     steps:
       - name: Checkout Code
@@ -64,11 +62,11 @@ jobs:
         run: |
           python -u main.py ${{ matrix.market }}
 
-      # 💡 [新增] 只有在台灣市場 (tw) 執行成功時，觸發另一個 Repo
+      # 🚀 新增連動步驟：只有台灣成功時，才發送訊號給下一個 Repo
       - name: 📢 Trigger Alpha Data Lab Sync
         if: success() && matrix.market == 'tw'
         run: |
-          echo "🚀 台灣數據更新成功，正在觸發 Alpha-Data-Cleaning-Lab..."
+          echo "🚀 台灣數據更新成功，正在遠端觸發 Alpha-Data-Cleaning-Lab..."
           curl -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
           -H "Accept: application/vnd.github.v3+json" \
           -H "Authorization: bearer $GH_PAT" \
