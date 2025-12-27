@@ -61,6 +61,9 @@
 
 ---
 
+<img width="679" height="745" alt="image" src="https://github.com/user-attachments/assets/62e191d8-e10c-45a5-b0cd-f42b365d76df" />
+
+
 ## 📄 免責聲明 (Disclaimer)
 
 本專案僅供研究與教育用途，所提供之數據不構成任何投資建議。投資人應自行評估風險，並對其投資結果負責。
