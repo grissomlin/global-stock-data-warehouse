@@ -10,7 +10,8 @@ on:
         type: choice
         options: [all, tw, us, cn, hk, jp, kr]
   schedule:
-    - cron: '30 10 * * 1-5' # 台北時間 18:30 執行
+    # 💡 修改為台北時間 14:00 執行 (14:00 CST = 06:00 UTC)
+    - cron: '0 6 * * 1-5' 
 
 jobs:
   prepare-matrix:
@@ -29,7 +30,6 @@ jobs:
   execute-task:
     needs: prepare-matrix
     runs-on: ubuntu-latest
-    # 💡 增加超時保護，防止 yfinance 卡死浪費分鐘數
     timeout-minutes: 180 
     strategy:
       fail-fast: false
@@ -41,13 +41,15 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       GDRIVE_SERVICE_ACCOUNT: ${{ secrets.GDRIVE_SERVICE_ACCOUNT }}
+      # 💡 跨 Repo 觸發需要的 Token (需在 Secrets 設定 GH_PAT)
+      GH_PAT: ${{ secrets.GH_PAT }}
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4 # 💡 升級到 v4
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5 # 💡 升級到 v5
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -55,14 +57,22 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # 💡 確保安裝所有必要的套件，避免 ModuleNotFoundError
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install resend google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dotenv
 
       - name: Run Market Update
         run: |
-          # 💡 使用 -u 參數強制讓 python 即時印出 log，方便在 GitHub Actions 監控進度
           python -u main.py ${{ matrix.market }}
+
+      # 💡 [新增] 只有在台灣市場 (tw) 執行成功時，觸發另一個 Repo
+      - name: 📢 Trigger Alpha Data Lab Sync
+        if: success() && matrix.market == 'tw'
+        run: |
+          echo "🚀 台灣數據更新成功，正在觸發 Alpha-Data-Cleaning-Lab..."
+          curl -X POST https://api.github.com/repos/grissomlin/Alpha-Data-Cleaning-Lab/dispatches \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization: bearer $GH_PAT" \
+          -d '{"event_type": "warehouse_sync_complete"}'
 
       - name: Notify System Failure
         if: failure()
