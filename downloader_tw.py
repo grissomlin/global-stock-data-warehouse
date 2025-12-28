@@ -77,7 +77,7 @@ def get_tw_stock_list():
 
 # ========== 4. 下載邏輯 (單執行緒穩定版) ==========
 def download_one_stable(symbol, mode):
-    start_date = "2020-01-01" if mode == 'hot' else "1993-01-04"
+    start_date = "2023-01-01" if mode == 'hot' else "1993-01-04"
     try:
         # 強制單執行緒，防止記憶體污染
         df = yf.download(symbol, start=start_date, progress=False, timeout=20, 
@@ -133,3 +133,4 @@ def run_sync(mode='hot'):
 
 if __name__ == "__main__":
     run_sync(mode='hot')
+
