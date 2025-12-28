@@ -1,62 +1,55 @@
 # -*- coding: utf-8 -*-
-import os, sys, time, random, sqlite3, requests, io, subprocess
+"""
+downloader_jp.py
+----------------
+日股資料下載器（穩定單執行緒版）
+
+✔ 改為單執行緒循環：確保 JPX 大量標的下載時數據 100% 準確
+✔ 自動處理 .xls：解決 JPX 官方清單讀取問題
+✔ 結構統一：完全支援 Alpha Lab 連動機制
+"""
+
+import os, sys, sqlite3, time, random, io, subprocess
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import requests
 
 # =====================================================
 # 1. 環境設定
 # =====================================================
-
 MARKET_CODE = "jp-share"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "jp_stock_warehouse.db")
-IS_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
-
-MAX_WORKERS = 4 if IS_GITHUB_ACTIONS else 8
 
 def log(msg: str):
-    print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
+    print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}", flush=True)
 
 # =====================================================
-# 2. Excel 讀取支援
+# 2. Excel 支援與資料庫初始化
 # =====================================================
-
 def ensure_excel_tool():
     try:
-        import xlrd  # noqa
+        import xlrd
     except ImportError:
-        log("🔧 安裝 xlrd 以支援 .xls")
+        log("🔧 安裝 xlrd 以支援 JPX 官方表格...")
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "xlrd"])
-
-# =====================================================
-# 3. DB 初始化（結構對齊全球）
-# =====================================================
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_prices (
-                date TEXT,
-                symbol TEXT,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume INTEGER,
+                date TEXT, symbol TEXT, open REAL, high REAL, 
+                low REAL, close REAL, volume INTEGER,
                 PRIMARY KEY (date, symbol)
             )
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS stock_info (
-                symbol TEXT PRIMARY KEY,
-                name TEXT,
-                sector TEXT,
-                market TEXT,
-                updated_at TEXT
+                symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, 
+                market TEXT, updated_at TEXT
             )
         """)
         conn.commit()
@@ -64,35 +57,27 @@ def init_db():
         conn.close()
 
 # =====================================================
-# 4. 取得 JPX 股票清單（完全對齊實際 Excel 欄位）
+# 3. 取得 JPX 股票清單
 # =====================================================
-
 def get_jp_stock_list():
-    """
-    使用 JPX 官方英文版 Excel
-    欄位實際為：
-    Local Code / Name (English) / Section/Products / 33 Sector(name)
-    """
     ensure_excel_tool()
-
     url = "https://www.jpx.co.jp/english/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_e.xls"
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://www.jpx.co.jp/english/markets/statistics-equities/misc/01.html"
     }
 
-    log("📡 正在從 JPX 下載官方股票清單...")
+    log("📡 正在從 JPX 官網同步最新股票名單...")
 
     try:
         r = requests.get(url, headers=headers, timeout=30)
         r.raise_for_status()
         df = pd.read_excel(io.BytesIO(r.content))
-        log("✅ JPX Excel 下載成功")
     except Exception as e:
-        log(f"❌ JPX Excel 下載失敗: {e}")
+        log(f"❌ 下載失敗: {e}")
         return []
 
-    # 👉 明確指定欄位（不再猜）
+    # JPX Excel 標準欄位定義
     C_CODE = "Local Code"
     C_NAME = "Name (English)"
     C_PROD = "Section/Products"
@@ -103,65 +88,53 @@ def get_jp_stock_list():
 
     for _, row in df.iterrows():
         raw_code = row.get(C_CODE)
-        if pd.isna(raw_code):
-            continue
+        if pd.isna(raw_code): continue
 
-        # 修正 Excel 將代碼讀成 float 的問題
+        # 修正 Excel 代碼格式 (例如 7203.0 -> 7203)
         code = str(raw_code).split(".")[0].strip()
 
-        # ✅ 普通股：4 位純數字
-        if not (len(code) == 4 and code.isdigit()):
-            continue
+        # 僅保留 4 位數純數字普通股
+        if not (len(code) == 4 and code.isdigit()): continue
 
         product = str(row.get(C_PROD, "")).strip()
-
-        # ✅ 明確排除 ETF / ETN
-        if product.startswith("ETFs"):
-            continue
+        if product.startswith("ETFs"): continue # 排除 ETF
 
         symbol = f"{code}.T"
         name = str(row.get(C_NAME, "")).strip()
         sector = str(row.get(C_SECTOR, "Unknown")).strip()
-        market = product  # Prime / Standard / Growth
-
+        
         conn.execute("""
-            INSERT OR REPLACE INTO stock_info
-            (symbol, name, sector, market, updated_at)
+            INSERT OR REPLACE INTO stock_info (symbol, name, sector, market, updated_at)
             VALUES (?, ?, ?, ?, ?)
-        """, (
-            symbol,
-            name,
-            sector,
-            market,
-            datetime.now().strftime("%Y-%m-%d")
-        ))
-
+        """, (symbol, name, sector, product, datetime.now().strftime("%Y-%m-%d")))
         stock_list.append((symbol, name))
 
     conn.commit()
     conn.close()
-
-    log(f"✅ 日股清單導入完成：{len(stock_list)} 檔普通股")
+    log(f"✅ 日股名單同步完成：共 {len(stock_list)} 檔")
     return stock_list
 
 # =====================================================
-# 5. 下載股價（穩定版）
+# 4. 下載核心 (單執行緒穩定版)
 # =====================================================
-
-def download_one(args):
-    symbol, name, mode = args
+def download_one_jp(symbol, mode):
     start_date = "2020-01-01" if mode == "hot" else "2000-01-01"
-
-    for attempt in range(3):
+    max_retries = 2
+    
+    for attempt in range(max_retries + 1):
         try:
-            time.sleep(random.uniform(0.1, 0.3))
-            tk = yf.Ticker(symbol)
-            df = tk.history(start=start_date, auto_adjust=True, timeout=30)
+            # 💡 核心修正：threads=False 徹底禁止併發，解決資料錯亂
+            df = yf.download(symbol, start=start_date, progress=False, 
+                             auto_adjust=True, threads=False, timeout=30)
 
             if df is None or df.empty:
-                if attempt < 2:
+                if attempt < max_retries:
+                    time.sleep(2)
                     continue
-                return {"symbol": symbol, "status": "empty"}
+                return None
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
 
             df = df.reset_index()
             df.columns = [c.lower() for c in df.columns]
@@ -169,67 +142,61 @@ def download_one(args):
             if "date" in df.columns:
                 df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None).dt.strftime("%Y-%m-%d")
 
-            out = df[["date", "open", "high", "low", "close", "volume"]].copy()
-            out["symbol"] = symbol
-
-            conn = sqlite3.connect(DB_PATH, timeout=60)
-            out.to_sql(
-                "stock_prices",
-                conn,
-                if_exists="append",
-                index=False,
-                method=lambda t, c, k, d: c.executemany(
-                    f"INSERT OR REPLACE INTO {t.name} ({', '.join(k)}) VALUES ({', '.join(['?']*len(k))})", d
-                )
-            )
-            conn.close()
-            return {"symbol": symbol, "status": "success"}
-
+            df_final = df[["date", "open", "high", "low", "close", "volume"]].copy()
+            df_final["symbol"] = symbol
+            return df_final
         except Exception:
-            time.sleep(2)
-
-    return {"symbol": symbol, "status": "error"}
+            if attempt < max_retries:
+                time.sleep(3)
+                continue
+            return None
 
 # =====================================================
-# 6. 主流程
+# 5. 主流程
 # =====================================================
-
 def run_sync(mode="hot"):
-    start = time.time()
+    start_time = time.time()
     init_db()
 
     items = get_jp_stock_list()
     if not items:
-        log("⚠️ JP 無任何股票，直接結束")
         return {"success": 0, "has_changed": False}
 
-    log(f"🚀 JP 同步開始 | 目標 {len(items)} 檔")
+    log(f"🚀 開始日股同步 (安全模式) | 目標: {len(items)} 檔")
 
-    stats = {"success": 0, "empty": 0, "error": 0}
-    fails = []
+    success_count = 0
+    conn = sqlite3.connect(DB_PATH, timeout=60)
+    
+    # 單執行緒循環
+    pbar = tqdm(items, desc="JP同步")
+    for symbol, name in pbar:
+        df_res = download_one_jp(symbol, mode)
+        
+        if df_res is not None:
+            # 使用 executemany 批次寫入以增進單執行緒下的效能
+            df_res.to_sql('stock_prices', conn, if_exists='append', index=False, 
+                          method=lambda table, conn, keys, data_iter: 
+                          conn.executemany(f"INSERT OR REPLACE INTO {table.name} ({', '.join(keys)}) VALUES ({', '.join(['?']*len(keys))})", data_iter))
+            success_count += 1
+        
+        # 🟢 加入微小延遲防止被 Yahoo 封鎖
+        time.sleep(0.05)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(download_one, (s, n, mode)): s for s, n in items}
-        for f in tqdm(as_completed(futures), total=len(futures), desc="JP同步"):
-            res = f.result()
-            stats[res["status"]] += 1
-            if res["status"] == "error":
-                fails.append(res["symbol"])
-
-    conn = sqlite3.connect(DB_PATH)
+    conn.commit()
+    
+    # 統計
+    log("🧹 執行資料庫 VACUUM...")
     conn.execute("VACUUM")
-    total = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_info").fetchone()[0]
+    total_in_db = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_info").fetchone()[0]
     conn.close()
 
-    mins = (time.time() - start) / 60
-    log(f"📊 JP 完成 | 費時 {mins:.1f} 分")
-    log(f"📈 股票總數 {total} | 成功 {stats['success']} | 空 {stats['empty']} | 失敗 {stats['error']}")
+    duration = (time.time() - start_time) / 60
+    log(f"📊 JP 同步完成 | 更新成功: {success_count}/{len(items)} | 費時 {duration:.1f} 分")
 
     return {
-        "success": stats["success"],
-        "total": total,
-        "fail_list": fails,
-        "has_changed": stats["success"] > 0
+        "success": success_count,
+        "total": total_in_db,
+        "has_changed": success_count > 0
     }
 
 if __name__ == "__main__":
