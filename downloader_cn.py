@@ -76,7 +76,7 @@ def get_cn_stock_list_with_sector():
 
 # ========== 4. 核心下載邏輯 (單執行緒穩定版) ==========
 def download_one_cn(symbol, mode):
-    start_date = "2020-01-01" if mode == 'hot' else "2015-01-01"
+    start_date = "2023-01-01" if mode == 'hot' else "2015-01-01"
     max_retries = 1
     
     for attempt in range(max_retries + 1):
@@ -161,3 +161,4 @@ def run_sync(mode='hot'):
 
 if __name__ == "__main__":
     run_sync(mode='hot')
+
