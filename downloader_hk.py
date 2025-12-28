@@ -108,7 +108,7 @@ def get_hk_stock_list():
 
 # ========== 4. 下載核心邏輯 (單執行緒穩定版) ==========
 def download_one_hk(code_5d, mode):
-    start_date = "2020-01-01" if mode == "hot" else "2000-01-01"
+    start_date = "2023-01-01" if mode == "hot" else "2000-01-01"
     
     # 港股代碼嘗試：yfinance 有時接受 0001.HK 有時接受 1.HK
     possible_syms = [f"{code_5d}.HK"]
@@ -191,3 +191,4 @@ def run_sync(mode="hot"):
 
 if __name__ == "__main__":
     run_sync(mode="hot")
+
