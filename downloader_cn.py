@@ -1,27 +1,20 @@
 # -*- coding: utf-8 -*-
-import os, sys, sqlite3, time, random, io, re
+import os, io, time, random, sqlite3, requests
 import pandas as pd
 import yfinance as yf
+from io import StringIO
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 # ========== 1. 環境設定 ==========
 MARKET_CODE = "cn-share"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "cn_stock_warehouse.db")
-IS_GITHUB_ACTIONS = os.getenv('GITHUB_ACTIONS') == 'true'
-
-# ✅ 效能調優核心參數
-BATCH_SIZE = 50        # 每批次處理 50 檔股票 (平衡速度與伺服器負荷)
-MAX_WORKERS = 4 if IS_GITHUB_ACTIONS else 10 
-BATCH_DELAY = (4.0, 7.0) if IS_GITHUB_ACTIONS else (0.5, 1.2)
 
 def log(msg: str):
-    print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
+    print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}", flush=True)
 
 # ========== 2. 資料庫初始化 ==========
-
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -40,48 +33,32 @@ def init_db():
     finally:
         conn.close()
 
-# ========== 3. 獲取 A 股清單與產業別 (Akshare 強化) ==========
-
+# ========== 3. 獲取 A 股清單 (穩定版) ==========
 def get_cn_stock_list_with_sector():
-    """從 Akshare 獲取清單並盡量補齊產業分類"""
     import akshare as ak
-    log("📡 正在從 Akshare 同步 A 股清單與行業分類...")
+    log("📡 正在獲取 A 股清單...")
     
     try:
-        # 1. 獲取全體 A 股即時行情作為基礎清單
+        # 獲取全體 A 股即時行情
         df_spot = ak.stock_zh_a_spot_em()
         
-        # 2. 獲取行業板塊資訊
-        log("🔍 正在獲取行業分類對照表...")
-        df_ind = ak.stock_board_industry_name_em()
-        
-        # 建立 股票代碼 -> 行業名稱 的映射字典
-        sector_map = {}
-        # 為了效率，我們抓取熱門行業的成分股來映射（這能補齊大部分正股）
-        # 這裡只取前 50 個行業板塊以節省名單初始化時間
-        for ind_name in df_ind['板块名称'].head(60).tolist():
-            try:
-                cons = ak.stock_board_industry_cons_em(symbol=ind_name)
-                for code in cons['代码'].tolist():
-                    sector_map[str(code).zfill(6)] = ind_name
-            except:
-                continue
-
         conn = sqlite3.connect(DB_PATH)
         stock_list = []
         
+        # 只取主要的板塊：主板、創業板、科創板
         valid_prefixes = ('000','001','002','003','300','301','600','601','603','605','688')
         
         for _, row in df_spot.iterrows():
             code = str(row['代码']).zfill(6)
             if not code.startswith(valid_prefixes): continue
             
-            # 自動判斷市場
+            # Yahoo Finance A股格式：上海 .SS, 深圳 .SZ
             symbol = f"{code}.SS" if code.startswith('6') else f"{code}.SZ"
             market = "SSE" if code.startswith('6') else "SZSE"
-            
             name = row['名称']
-            sector = sector_map.get(code, "Unknown")
+            
+            # 簡化行業獲取，若無映射則標註為 A-Share
+            sector = "A-Share"
             
             conn.execute("""
                 INSERT OR REPLACE INTO stock_info (symbol, name, sector, market, updated_at) 
@@ -91,116 +68,95 @@ def get_cn_stock_list_with_sector():
             
         conn.commit()
         conn.close()
-        log(f"✅ 成功同步 A 股清單: {len(stock_list)} 檔 (包含行業映射)")
+        log(f"✅ 成功取得 A 股清單: {len(stock_list)} 檔")
         return stock_list
     except Exception as e:
         log(f"❌ 獲取名單失敗: {e}")
         return []
 
-# ========== 4. 批量下載邏輯 (速度優化核心) ==========
-
-def download_batch_task(batch_items, mode):
-    """執行批次下載與存檔"""
-    symbols = [it[0] for it in batch_items]
+# ========== 4. 核心下載邏輯 (單執行緒穩定版) ==========
+def download_one_cn(symbol, mode):
     start_date = "2020-01-01" if mode == 'hot' else "2015-01-01"
+    max_retries = 1
     
-    try:
-        # 💡 使用批量下載，一次請求多檔股票
-        data = yf.download(
-            tickers=symbols,
-            start=start_date,
-            group_by='ticker',
-            auto_adjust=True,
-            threads=False, # 我們外部已使用線程池
-            progress=False,
-            timeout=40
-        )
-        
-        if data.empty: return 0
-        
-        conn = sqlite3.connect(DB_PATH, timeout=60)
-        success_count = 0
-        
-        # 遍歷批次中的每個符號
-        for symbol in symbols:
-            try:
-                # 處理 yf.download 可能回傳的多層或單層索引
-                if len(symbols) > 1:
-                    df = data[symbol].copy()
-                else:
-                    df = data.copy()
-                
-                df.dropna(how='all', inplace=True)
-                if df.empty: continue
-                
-                df.reset_index(inplace=True)
-                df.columns = [c.lower() for c in df.columns]
-                
-                # 取得日期
-                date_col = 'date' if 'date' in df.columns else df.columns[0]
-                df['date_str'] = pd.to_datetime(df[date_col]).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-                
-                # 寫入價格
-                for _, row in df.iterrows():
-                    conn.execute("""
-                        INSERT OR REPLACE INTO stock_prices (date, symbol, open, high, low, close, volume)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (row['date_str'], symbol, row['open'], row['high'], row['low'], row['close'], row['volume']))
-                success_count += 1
-            except:
+    for attempt in range(max_retries + 1):
+        try:
+            # 💡 關鍵修正：threads=False 徹底防止記憶體錯亂，禁止批量模式
+            df = yf.download(symbol, start=start_date, progress=False, timeout=25, 
+                             auto_adjust=True, threads=False)
+            
+            if df is None or df.empty:
+                if attempt < max_retries:
+                    time.sleep(2)
+                    continue
+                return None
+            
+            # 處理 MultiIndex 結構 (單檔下載有時也會觸發)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
+            df.reset_index(inplace=True)
+            df.columns = [c.lower() for c in df.columns]
+            
+            # 取得日期欄位名稱
+            date_col = 'date' if 'date' in df.columns else df.columns[0]
+            df['date_str'] = pd.to_datetime(df[date_col]).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+            
+            df_final = df[['date_str', 'open', 'high', 'low', 'close', 'volume']].copy()
+            df_final.columns = ['date', 'open', 'high', 'low', 'close', 'volume']
+            df_final['symbol'] = symbol
+            
+            return df_final
+        except:
+            if attempt < max_retries:
+                time.sleep(3)
                 continue
-        
-        conn.commit()
-        conn.close()
-        return success_count
-    except Exception as e:
-        # log(f"批次下載異常: {e}")
-        return 0
+            return None
 
 # ========== 5. 主流程 ==========
-
 def run_sync(mode='hot'):
     start_time = time.time()
     init_db()
     
-    # 1. 獲取名單與產業
     items = get_cn_stock_list_with_sector()
     if not items:
         return {"success": 0, "has_changed": False}
 
-    # 2. 切分批次 (Batching)
-    batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
-    log(f"🚀 開始 A 股同步 | 總目標: {len(items)} 檔 | 總批次: {len(batches)}")
+    log(f"🚀 開始 CN 數據同步 (安全模式) | 目標: {len(items)} 檔")
 
-    total_success = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_batch = {executor.submit(download_batch_task, b, mode): b for b in batches}
+    success_count = 0
+    conn = sqlite3.connect(DB_PATH, timeout=60)
+    
+    # 💡 採用穩定單執行緒循環，徹底解決數據混淆問題
+    pbar = tqdm(items, desc="CN同步")
+    for symbol, name in pbar:
+        df_res = download_one_cn(symbol, mode)
         
-        pbar = tqdm(total=len(items), desc="CN數據同步")
-        for f in as_completed(future_to_batch):
-            # 💡 批次間隨機等待，避免被 Yahoo 封鎖 IP
-            time.sleep(random.uniform(*BATCH_DELAY))
-            
-            res = f.result()
-            total_success += res
-            pbar.update(BATCH_SIZE)
-        pbar.close()
+        if df_res is not None:
+            # 寫入資料庫
+            df_res.to_sql('stock_prices', conn, if_exists='append', index=False, 
+                          method=lambda table, conn, keys, data_iter: 
+                          conn.executemany(f"INSERT OR REPLACE INTO {table.name} ({', '.join(keys)}) VALUES ({', '.join(['?']*len(keys))})", data_iter))
+            success_count += 1
+        
+        # 🟢 稍微延遲，避開頻率限制
+        time.sleep(0.05)
+    
+    conn.commit()
 
-    # 3. 資料庫優化
+    # 優化與統計
     log("🧹 執行資料庫優化 (VACUUM)...")
-    conn = sqlite3.connect(DB_PATH)
     conn.execute("VACUUM")
-    # 統計有效標的
     db_count = conn.execute("SELECT COUNT(DISTINCT symbol) FROM stock_info").fetchone()[0]
     conn.close()
 
     duration = (time.time() - start_time) / 60
-    log(f"📊 同步完成！庫存總數: {db_count} | 本次更新: {total_success} | 費時: {duration:.1f} 分鐘")
+    log(f"📊 同步完成！庫存總數: {db_count} | 更新成功: {success_count} | 費時: {duration:.1f} 分鐘")
     
     return {
-        "success": total_success,
+        "success": success_count,
         "total": len(items),
-        "has_changed": total_success > 0
+        "has_changed": success_count > 0
     }
 
 if __name__ == "__main__":
