@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv() 
 
 socket.setdefaulttimeout(600)
-GDRIVE_FOLDER_ID = '1ltKCQ209k9MFuWV6FIxQ1coinV2fxSyl' 
+GDRIVE_FOLDER_ID = os.environ.get('GDRIVE_FOLDER_ID')
 SERVICE_ACCOUNT_FILE = 'citric-biplane-319514-75fead53b0f5.json'
 
 try:
@@ -180,3 +180,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
