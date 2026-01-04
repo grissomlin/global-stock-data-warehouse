@@ -7,13 +7,25 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from dotenv import load_dotenv
 
-# 💡 核心修正：載入環境變數
+# 💡 1. 環境設定
 load_dotenv() 
-
 socket.setdefaulttimeout(600)
+
+# 強制日期設定 (根據你的要求鎖定年份)
+FORCE_START_DATE = "2024-01-01"
+FORCE_END_DATE = "2025-12-31"
+
 GDRIVE_FOLDER_ID = os.environ.get('GDRIVE_FOLDER_ID')
 SERVICE_ACCOUNT_FILE = 'citric-biplane-319514-75fead53b0f5.json'
 
+# 💡 2. 導入特徵加工模組
+try:
+    from processor import process_market_data
+except ImportError:
+    print("⚠️ 系統提示：找不到 processor.py")
+    process_market_data = None
+
+# 💡 3. 導入通知模組 (保留 notifier 功能)
 try:
     from notifier import StockNotifier
     notifier = StockNotifier()
@@ -23,12 +35,13 @@ except Exception as e:
 
 import downloader_tw, downloader_us, downloader_cn, downloader_hk, downloader_jp, downloader_kr
 
-# 📊 修正標的門檻：TW 調升至 2500 檔
+# 📊 門檻門檻設定
 EXPECTED_MIN_STOCKS = {
     'tw': 2500, 'us': 5684, 'cn': 5496, 'hk': 2689, 'jp': 4315, 'kr': 2000
 }
 
-# [Google Drive 相關函式維持原樣]
+# ========== [Google Drive 相關函式 - 原封不動保留] ==========
+
 def get_drive_service():
     env_json = os.environ.get('GDRIVE_SERVICE_ACCOUNT')
     try:
@@ -85,7 +98,7 @@ def upload_db_to_drive(service, file_path, retries=3):
             time.sleep(5)
     return False
 
-def check_needs_update(db_path, market_id):
+def check_needs_update(db_path):
     if not os.path.exists(db_path): return True
     try:
         conn = sqlite3.connect(db_path)
@@ -93,18 +106,15 @@ def check_needs_update(db_path, market_id):
         conn.close()
         db_latest_date = res[0] if res and res[0] else None
         if not db_latest_date: return True
+        # 只要最新日期小於當前日期，就更新（但在 run_sync 會被限制在 2025）
         today_str = datetime.now().strftime('%Y-%m-%d')
-        if db_latest_date >= today_str:
-            print(f"✅ {market_id.upper()} 數據已是最新 ({db_latest_date})。")
-            return False
-        return True
+        return db_latest_date < today_str
     except: return True
 
 def get_db_summary(db_path, market_id, fail_list=None):
     if not os.path.exists(db_path): return None
     try:
         conn = sqlite3.connect(db_path)
-        # 修正：精確計算不重複標的數
         df_stats = pd.read_sql("SELECT COUNT(DISTINCT symbol) as s, MAX(date) as d2, COUNT(*) as t FROM stock_prices", conn)
         info_count = conn.execute("SELECT COUNT(*) FROM stock_info").fetchone()[0]
         conn.close()
@@ -120,11 +130,13 @@ def get_db_summary(db_path, market_id, fail_list=None):
             "market": market_id.upper(), "expected": expected, "success": success_count,
             "coverage": f"{coverage:.1f}%", "end_date": latest_date, "total_rows": total_rows,
             "names_synced": info_count, "fail_list": fail_list if fail_list else [],
-            "status": "✅" if 80 <= coverage <= 120 else "⚠️"
+            "status": "✅" if coverage >= 80 else "⚠️"
         }
     except Exception as e:
         print(f"⚠️ {market_id.upper()} 摘要失敗: {e}")
         return None
+
+# ========== [主流程] ==========
 
 def main():
     target_market = sys.argv[1].lower() if len(sys.argv) > 1 else None
@@ -144,24 +156,35 @@ def main():
         if service and not os.path.exists(db_file):
             download_db_from_drive(service, db_file)
 
-        needs_update = check_needs_update(db_file, m)
+        needs_update = check_needs_update(db_file)
         execution_results = {"has_changed": False, "fail_list": []}
         
         if needs_update:
             target_module = module_map.get(m)
-            # 執行下載
-            execution_results = target_module.run_sync(mode='hot') 
+            # 💡 關鍵修正：傳送強制日期給下載模組
+            print(f"📡 執行同步: 範圍設定為 {FORCE_START_DATE} ~ {FORCE_END_DATE}")
+            execution_results = target_module.run_sync(
+                start_date=FORCE_START_DATE, 
+                end_date=FORCE_END_DATE,
+                max_workers=8
+            ) 
         
-        # 即使下載模組回傳沒變動，只要 needs_update 成立就執行後續
+        # 執行特徵加工
+        if process_market_data and os.path.exists(db_file):
+            print(f"🧪 執行特徵工程加工...")
+            try:
+                process_market_data(db_file)
+            except Exception as e:
+                print(f"❌ 特徵加工出錯: {e}")
+
         has_changed = execution_results.get('has_changed', False) if isinstance(execution_results, dict) else False
         current_fails = execution_results.get('fail_list', []) if isinstance(execution_results, dict) else []
         
         summary = get_db_summary(db_file, m, fail_list=current_fails)
         if summary:
             all_summaries.append(summary)
-            print(f"📊 摘要: {m.upper()} | 日期: {summary['end_date']} | 覆蓋率: {summary['coverage']}")
 
-        # 💡 核心判定修正：只要有執行下載 (needs_update) 就上傳，確保覆蓋雲端可能的壞檔
+        # 只要有執行過更新或資料變動就同步雲端
         if service and (has_changed or needs_update):
             print(f"🔄 執行雲端同步中...")
             try:
@@ -171,13 +194,11 @@ def main():
                 upload_db_to_drive(service, db_file)
             except Exception as e:
                 print(f"❌ 優化或上傳失敗: {e}")
-        else:
-            print(f"⏭️ {m.upper()} 無變動，略過同步。")
 
+    # 💡 保留 Notifier 發送功能
     if notifier and all_summaries:
         print("📨 發送報告中...")
         notifier.send_stock_report_email(all_summaries)
 
 if __name__ == "__main__":
     main()
-
