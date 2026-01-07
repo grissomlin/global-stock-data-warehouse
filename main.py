@@ -13,7 +13,7 @@ socket.setdefaulttimeout(600)
 
 # 強制日期設定 (根據你的要求鎖定年份)
 FORCE_START_DATE = "2024-01-01"
-FORCE_END_DATE = "2025-12-31"
+FORCE_END_DATE = "2026-12-31"
 
 GDRIVE_FOLDER_ID = os.environ.get('GDRIVE_FOLDER_ID')
 SERVICE_ACCOUNT_FILE = 'citric-biplane-319514-75fead53b0f5.json'
@@ -202,3 +202,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
